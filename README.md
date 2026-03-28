@@ -61,3 +61,21 @@ npm start
 - `scan_plan` actions now include a one-click runner that iterates plan steps and executes generated probes in order.
 - Every non-`GET` probe execution path (manual probe, chain step, and scan-plan runner) requires an explicit confirmation prompt before execution.
 - `/api/health` should still respond for quick diagnostics.
+
+## Deploy On Vercel
+
+1. Import the repository into Vercel.
+1. Framework preset: `Other`.
+1. Build command: leave empty.
+1. Output directory: leave empty.
+1. Install command: `npm install`.
+1. Add environment variables in Vercel Project Settings:
+
+```env
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+OPENROUTER_SECURITY_MODEL=openai/gpt-4o
+```
+
+1. Deploy.
+
+`vercel.json` routes all requests (static UI and API routes) through the Express app in `server.js`.

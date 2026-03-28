@@ -660,6 +660,10 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`AgentMan server listening on http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`AgentMan server listening on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;

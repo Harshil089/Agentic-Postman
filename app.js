@@ -1091,6 +1091,25 @@ function removeTypingIndicator() { document.getElementById('typing-indicator')?.
 
 function quickPrompt(text) { document.getElementById('agent-input').value = text; askAgent(); }
 
+function promptSecurityTarget() {
+  const domain = window.prompt(
+    'Enter target domain or URL for security scan.\n\nExamples:\n  example.com\n  https://api.example.com\n  http://localhost:8080\n\nLeave blank to use current endpoint.'
+  );
+  if (domain === null) return;
+
+  let targetUrl = domain.trim();
+  if (!targetUrl) {
+    const current = getActive();
+    targetUrl = current?.url || 'current endpoint';
+  } else if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+    targetUrl = 'https://' + targetUrl;
+  }
+
+  const msg = `Run a full security scan on ${targetUrl}`;
+  document.getElementById('agent-input').value = msg;
+  askAgent();
+}
+
 function renderDebugInfoAction(action) {
   let dbgText = `<strong>Debug findings:</strong><br>`;
   dbgText += action.findings.map(f => `• ${escHtml(f)}`).join('<br>');

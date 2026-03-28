@@ -379,6 +379,43 @@ async function openRouterGenerateJson({ model, systemPrompt, userContent, temper
   throw err;
 }
 
+async function openRouterGenerateJsonWithFallback({
+  model,
+  systemPrompt,
+  userContent,
+  temperature = 0.2,
+  maxTokens = 1000,
+  fallbackTokens = [1400, 1200, 1000, 800, 600]
+}) {
+  const tried = new Set();
+  const tokenPlan = [maxTokens, ...fallbackTokens].filter(x => Number.isFinite(x) && x > 0);
+  let lastError;
+
+  for (const tokens of tokenPlan) {
+    if (tried.has(tokens)) continue;
+    tried.add(tokens);
+
+    try {
+      return await openRouterGenerateJson({
+        model,
+        systemPrompt,
+        userContent,
+        temperature,
+        maxTokens: tokens
+      });
+    } catch (error) {
+      lastError = error;
+      const msg = String(error?.message || '').toLowerCase();
+      const isTokenBudgetIssue = msg.includes('fewer max_tokens') || msg.includes('requested up to');
+      if (!isTokenBudgetIssue) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error('OpenRouter request failed after token fallback attempts.');
+}
+
 function parseAgentPayload(raw) {
   let parsed;
   try {
@@ -535,12 +572,13 @@ app.post('/api/security-agent', async (req, res) => {
       return res.status(400).json({ error: 'Missing security context object.' });
     }
 
-    const raw = await openRouterGenerateJson({
+    const raw = await openRouterGenerateJsonWithFallback({
       model,
       systemPrompt: SECURITY_MASTER_PROMPT,
       userContent: JSON.stringify(context),
       temperature: 0.1,
-      maxTokens: 1800
+      maxTokens: 1400,
+      fallbackTokens: [1200, 1000, 800, 600]
     });
 
     const payload = parseSecurityPayload(raw);

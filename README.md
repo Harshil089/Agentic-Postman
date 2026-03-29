@@ -7,12 +7,12 @@ Professionalized Postman-like API IDE with an AI agent backend.
 - `agentman.html`: UI shell and layout
 - `styles.css`: styling
 - `app.js`: frontend state + interactions + calls to backend APIs
-- `server.js`: Express server, static hosting, secure OpenRouter integration
+- `server.js`: Express server, static hosting, secure OpenRouter/Gemini integration
 
 ## Why this design
 
 - The master system prompt now lives on the server (not in browser code).
-- `OPENROUTER_API_KEY` is loaded from environment variables.
+- `OPENROUTER_API_KEY` and `GEMINI_API_KEY` are loaded from environment variables.
 - Frontend talks only to internal routes:
   - `POST /api/agent`
   - `POST /api/security-agent`
@@ -34,10 +34,11 @@ npm install
 cp .env.example .env
 ```
 
-1. Set your OpenRouter API key in `.env`:
+1. Set your model provider API keys in `.env`:
 
 ```env
 OPENROUTER_API_KEY=your_openrouter_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
 OPENROUTER_SECURITY_MODEL=openai/gpt-4o
 PORT=3000
 ```
@@ -54,7 +55,9 @@ npm start
 
 ## Notes
 
-- If `OPENROUTER_API_KEY` is missing, `/api/agent` and `/api/assertions` will return an error.
+- The model provider selector in the agent prompt area lets you switch between OpenRouter and Gemini for `/api/agent`, `/api/assertions`, and `/api/security-agent`.
+- If `OPENROUTER_API_KEY` is missing, OpenRouter calls will fail.
+- If `GEMINI_API_KEY` is missing, Gemini calls will fail.
 - `/api/security-agent` accepts either a top-level security context payload or `{ context: { ... } }` and returns strict JSON for `message`, `threat_level`, `findings`, and `actions`.
 - Security instructions (for example, scan/audit/pentest/IDOR/SQLi/SSRF) are automatically routed to the security agent in the chat panel.
 - In Agent mode, non-destructive `GET` probes are auto-executed; mutating probes and probe chains are exposed as action chips for explicit user-triggered execution.
@@ -73,9 +76,10 @@ npm start
 
 ```env
 OPENROUTER_API_KEY=your_openrouter_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
 OPENROUTER_SECURITY_MODEL=openai/gpt-4o
 ```
 
 1. Deploy.
 
-`vercel.json` routes all requests (static UI and API routes) through the Express app in `server.js`.
+`vercel.json` serves the frontend as static files and routes only `/api/*` through the Express serverless entry.

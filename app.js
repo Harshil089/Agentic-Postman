@@ -3,6 +3,15 @@ const OPENROUTER_MODELS = {
   advanced: 'openai/gpt-4o-mini',
   security: 'openai/gpt-4o'
 };
+const GEMINI_MODELS = {
+  default: 'gemini-1.5-flash',
+  advanced: 'gemini-1.5-flash',
+  security: 'gemini-1.5-flash'
+};
+const MODEL_PROVIDERS = {
+  openrouter: 'openrouter',
+  gemini: 'gemini'
+};
 const BACKEND_ENDPOINTS = {
   agent: '/api/agent',
   assertions: '/api/assertions',
@@ -31,6 +40,7 @@ let activeId = 1;
 let lastResponse = null;
 let idCounter = 3;
 let agentMode = 'agent';
+let selectedModelProvider = MODEL_PROVIDERS.openrouter;
 let chatSessionId = 1;
 let chatGoal = '';
 let conversationHistory = [];
@@ -172,6 +182,26 @@ function renderAgentMode() {
   sendBtn.textContent = agentRunState.isRunning ? 'Running…' : meta.button;
   inputEl.placeholder = meta.placeholder;
   syncAgentRunControls();
+}
+
+function renderModelProvider() {
+  const switchEl = document.getElementById('provider-switch');
+  if (!switchEl) return;
+  switchEl.querySelectorAll('.provider-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.provider === selectedModelProvider);
+  });
+}
+
+function setModelProvider(provider) {
+  if (!Object.values(MODEL_PROVIDERS).includes(provider)) return;
+  if (agentRunState.isRunning) {
+    addAgentMsg('system', 'Stop the current run before switching model provider.');
+    return;
+  }
+  selectedModelProvider = provider;
+  renderModelProvider();
+  const label = provider === MODEL_PROVIDERS.gemini ? 'Gemini' : 'OpenRouter';
+  addAgentMsg('system', `Model provider switched to ${label}.`);
 }
 
 function setAgentMode(mode) {
@@ -927,7 +957,8 @@ async function autoSuggestAssertions() {
     const parsed = await callBackendJson(BACKEND_ENDPOINTS.assertions, {
       status: lastResponse.status,
       body_preview: preview,
-      model: OPENROUTER_MODELS.default
+      provider: selectedModelProvider,
+      model: selectedModelProvider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.default : OPENROUTER_MODELS.default
     });
     const arr = Array.isArray(parsed?.assertions) ? parsed.assertions : [];
     if (!arr.length) return;
@@ -961,7 +992,10 @@ function buildUserContext(req, resp, userMsg) {
   });
 }
 
-function pickOpenRouterModel(userMsg) {
+function pickAgentModel(userMsg) {
+  if (selectedModelProvider === MODEL_PROVIDERS.gemini) {
+    return GEMINI_MODELS.default;
+  }
   const msg = (userMsg || '').toLowerCase();
   if (msg.includes('complex debug') || (msg.includes('debug') && msg.includes('chain'))) {
     return OPENROUTER_MODELS.advanced;
@@ -1310,13 +1344,15 @@ async function askAgent() {
       const stepUserMsg = buildAgentContinuationMessage(initialUserMsg, step);
       const r = getActive();
       const userContext = buildUserContext(r, lastResponse, stepUserMsg);
-      const model = pickOpenRouterModel(stepUserMsg);
+      const model = pickAgentModel(stepUserMsg);
+      const provider = selectedModelProvider;
 
       let raw;
       try {
         const controller = new AbortController();
         agentRunState.abortController = controller;
         raw = await callBackendJson(BACKEND_ENDPOINTS.agent, {
+          provider,
           model,
           context: JSON.parse(userContext)
         }, { signal: controller.signal });
@@ -1448,7 +1484,10 @@ function shortenUrl(url) {
 }
 
 async function callSecurityAgent(targetUrl, currentRequest, lastResponseData, authContext, testHistory, userInstruction, options = {}) {
+  const provider = selectedModelProvider;
+  const model = provider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.security : OPENROUTER_MODELS.security;
   return callBackendJson(BACKEND_ENDPOINTS.securityAgent, {
+    provider,
     context: {
       target_url: targetUrl,
       current_request: currentRequest,
@@ -1457,7 +1496,7 @@ async function callSecurityAgent(targetUrl, currentRequest, lastResponseData, au
       test_history: Array.isArray(testHistory) ? testHistory : [],
       user_instruction: userInstruction
     },
-    model: OPENROUTER_MODELS.security
+    model
   }, options);
 }
 
@@ -1538,6 +1577,7 @@ const origSendRequest = sendRequest;
 // Init
 loadActive();
 renderSidebar();
+renderModelProvider();
 renderAgentMode();
 syncAgentRunControls();
 renderScanProgress();

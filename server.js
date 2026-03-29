@@ -7,11 +7,23 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+
+const MODEL_PROVIDERS = {
+  openrouter: 'openrouter',
+  gemini: 'gemini'
+};
 
 const OPENROUTER_MODELS = {
   default: 'openrouter/auto',
   advanced: 'openai/gpt-4o-mini',
   security: process.env.OPENROUTER_SECURITY_MODEL || 'openai/gpt-4o'
+};
+
+const GEMINI_MODELS = {
+  default: process.env.GEMINI_DEFAULT_MODEL || 'gemini-1.5-flash',
+  advanced: process.env.GEMINI_ADVANCED_MODEL || 'gemini-1.5-flash',
+  security: process.env.GEMINI_SECURITY_MODEL || 'gemini-1.5-flash'
 };
 
 const AGENT_MASTER_PROMPT = `You are AgentMan — an agentic backend engine for a Postman-like API IDE.
@@ -309,22 +321,40 @@ app.get('/', (_req, res) => {
   res.sendFile(path.join(__dirname, 'agentman.html'));
 });
 
-function assertApiKeyConfigured() {
-  if (!OPENROUTER_API_KEY) {
+function parseProvider(providerRaw) {
+  if (providerRaw === MODEL_PROVIDERS.gemini) return MODEL_PROVIDERS.gemini;
+  return MODEL_PROVIDERS.openrouter;
+}
+
+function assertApiKeyConfigured(provider) {
+  if (provider === MODEL_PROVIDERS.gemini && !GEMINI_API_KEY) {
+    const err = new Error('Server is missing GEMINI_API_KEY. Add it to .env.');
+    err.status = 500;
+    throw err;
+  }
+  if (provider === MODEL_PROVIDERS.openrouter && !OPENROUTER_API_KEY) {
     const err = new Error('Server is missing OPENROUTER_API_KEY. Add it to .env.');
     err.status = 500;
     throw err;
   }
 }
 
-function parseModel(model) {
+function parseOpenRouterModel(model) {
   if (model === OPENROUTER_MODELS.security) return OPENROUTER_MODELS.security;
   if (model === OPENROUTER_MODELS.advanced) return OPENROUTER_MODELS.advanced;
   return OPENROUTER_MODELS.default;
 }
 
+function parseGeminiModel(model, profile = 'default') {
+  const allowed = new Set([GEMINI_MODELS.default, GEMINI_MODELS.advanced, GEMINI_MODELS.security]);
+  if (typeof model === 'string' && allowed.has(model)) return model;
+  if (profile === 'security') return GEMINI_MODELS.security;
+  if (profile === 'advanced') return GEMINI_MODELS.advanced;
+  return GEMINI_MODELS.default;
+}
+
 async function openRouterGenerateJson({ model, systemPrompt, userContent, temperature = 0.2, maxTokens = 1000 }) {
-  assertApiKeyConfigured();
+  assertApiKeyConfigured(MODEL_PROVIDERS.openrouter);
 
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
@@ -335,7 +365,7 @@ async function openRouterGenerateJson({ model, systemPrompt, userContent, temper
       'X-Title': 'AgentMan'
     },
     body: JSON.stringify({
-      model: parseModel(model),
+      model: parseOpenRouterModel(model),
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent }
@@ -375,6 +405,65 @@ async function openRouterGenerateJson({ model, systemPrompt, userContent, temper
   }
 
   const err = new Error('OpenRouter API returned an unexpected content shape.');
+  err.status = 502;
+  throw err;
+}
+
+async function geminiGenerateJson({ model, profile = 'default', systemPrompt, userContent, temperature = 0.2, maxTokens = 1000 }) {
+  assertApiKeyConfigured(MODEL_PROVIDERS.gemini);
+
+  const geminiModel = parseGeminiModel(model, profile);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      systemInstruction: {
+        role: 'system',
+        parts: [{ text: systemPrompt }]
+      },
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: userContent }]
+        }
+      ],
+      generationConfig: {
+        temperature,
+        maxOutputTokens: maxTokens,
+        responseMimeType: 'application/json'
+      }
+    })
+  });
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    const err = new Error('Gemini API returned a non-JSON response.');
+    err.status = 502;
+    throw err;
+  }
+
+  if (!response.ok) {
+    const err = new Error(data?.error?.message || `Gemini API error (${response.status}).`);
+    err.status = response.status;
+    throw err;
+  }
+
+  const parts = data?.candidates?.[0]?.content?.parts;
+  const text = Array.isArray(parts)
+    ? parts
+      .map(part => (part && typeof part.text === 'string' ? part.text : ''))
+      .join('')
+      .trim()
+    : '';
+
+  if (text) return text;
+
+  const err = new Error('Gemini API returned an unexpected content shape.');
   err.status = 502;
   throw err;
 }
@@ -494,16 +583,26 @@ app.post('/api/agent', async (req, res) => {
   try {
     const context = req.body?.context;
     const model = req.body?.model;
+    const provider = parseProvider(req.body?.provider);
 
     if (!context || typeof context !== 'object') {
       return res.status(400).json({ error: 'Missing request body field: context (object).' });
     }
 
-    const raw = await openRouterGenerateJson({
-      model,
-      systemPrompt: `${AGENT_MASTER_PROMPT}\n\n${MODE_RULES_PROMPT}\n\n${CONTEXT_AWARENESS_PROMPT}`,
-      userContent: JSON.stringify(context)
-    });
+    const systemPrompt = `${AGENT_MASTER_PROMPT}\n\n${MODE_RULES_PROMPT}\n\n${CONTEXT_AWARENESS_PROMPT}`;
+    const userContent = JSON.stringify(context);
+    const raw = provider === MODEL_PROVIDERS.gemini
+      ? await geminiGenerateJson({
+          model,
+          profile: 'default',
+          systemPrompt,
+          userContent
+        })
+      : await openRouterGenerateJson({
+          model,
+          systemPrompt,
+          userContent
+        });
 
     const payload = parseAgentPayload(raw);
     return res.json(payload);
@@ -518,6 +617,7 @@ app.post('/api/assertions', async (req, res) => {
     const status = req.body?.status;
     const bodyPreview = req.body?.body_preview;
     const model = req.body?.model;
+    const provider = parseProvider(req.body?.provider);
 
     if (typeof status !== 'number') {
       return res.status(400).json({ error: 'Missing request body field: status (number).' });
@@ -529,11 +629,20 @@ app.post('/api/assertions', async (req, res) => {
       body_preview: typeof bodyPreview === 'string' ? bodyPreview : ''
     };
 
-    const raw = await openRouterGenerateJson({
-      model,
-      systemPrompt: 'You are an API testing assistant. Return strict JSON only.',
-      userContent: JSON.stringify(instruction)
-    });
+    const systemPrompt = 'You are an API testing assistant. Return strict JSON only.';
+    const userContent = JSON.stringify(instruction);
+    const raw = provider === MODEL_PROVIDERS.gemini
+      ? await geminiGenerateJson({
+          model,
+          profile: 'default',
+          systemPrompt,
+          userContent
+        })
+      : await openRouterGenerateJson({
+          model,
+          systemPrompt,
+          userContent
+        });
 
     let parsed;
     try {
@@ -555,7 +664,8 @@ app.post('/api/assertions', async (req, res) => {
 
 app.post('/api/security-agent', async (req, res) => {
   try {
-    const model = req.body?.model || OPENROUTER_MODELS.security;
+    const provider = parseProvider(req.body?.provider);
+    const model = req.body?.model || (provider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.security : OPENROUTER_MODELS.security);
     const bodyContext = req.body?.context;
     const context = bodyContext && typeof bodyContext === 'object'
       ? bodyContext
@@ -572,14 +682,23 @@ app.post('/api/security-agent', async (req, res) => {
       return res.status(400).json({ error: 'Missing security context object.' });
     }
 
-    const raw = await openRouterGenerateJsonWithFallback({
-      model,
-      systemPrompt: SECURITY_MASTER_PROMPT,
-      userContent: JSON.stringify(context),
-      temperature: 0.1,
-      maxTokens: 1400,
-      fallbackTokens: [1200, 1000, 800, 600]
-    });
+    const raw = provider === MODEL_PROVIDERS.gemini
+      ? await geminiGenerateJson({
+          model,
+          profile: 'security',
+          systemPrompt: SECURITY_MASTER_PROMPT,
+          userContent: JSON.stringify(context),
+          temperature: 0.1,
+          maxTokens: 1200
+        })
+      : await openRouterGenerateJsonWithFallback({
+          model,
+          systemPrompt: SECURITY_MASTER_PROMPT,
+          userContent: JSON.stringify(context),
+          temperature: 0.1,
+          maxTokens: 1400,
+          fallbackTokens: [1200, 1000, 800, 600]
+        });
 
     const payload = parseSecurityPayload(raw);
     return res.json(payload);
@@ -656,7 +775,11 @@ app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
     model_default: OPENROUTER_MODELS.default,
-    model_security: OPENROUTER_MODELS.security
+    model_security: OPENROUTER_MODELS.security,
+    providers: {
+      openrouter: Boolean(OPENROUTER_API_KEY),
+      gemini: Boolean(GEMINI_API_KEY)
+    }
   });
 });
 

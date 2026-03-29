@@ -148,6 +148,13 @@
         <button class="quick-btn" onclick="promptSecurityTarget()">🛡 Security</button>
         <button class="quick-btn" onclick="startNewChat()">✦ New Chat</button>
       </div>
+      <div class="provider-toolbar">
+        <span class="provider-label">Model</span>
+        <div class="provider-switch" id="provider-switch">
+          <button class="provider-btn active" data-provider="openrouter" onclick="setModelProvider('openrouter')">OpenRouter</button>
+          <button class="provider-btn" data-provider="gemini" onclick="setModelProvider('gemini')">Gemini</button>
+        </div>
+      </div>
       <textarea class="agent-textarea" id="agent-input" placeholder="Describe a request, ask to debug, chain, or generate assertions..." rows="3"></textarea>
       <div class="agent-send-row">
         <button class="agent-send" id="agent-send-btn">Ask Agent ↗</button>

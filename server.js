@@ -21,10 +21,18 @@ const OPENROUTER_MODELS = {
 };
 
 const GEMINI_MODELS = {
-  default: process.env.GEMINI_DEFAULT_MODEL || 'gemini-1.5-flash',
-  advanced: process.env.GEMINI_ADVANCED_MODEL || 'gemini-1.5-flash',
-  security: process.env.GEMINI_SECURITY_MODEL || 'gemini-1.5-flash'
+  default: process.env.GEMINI_DEFAULT_MODEL || 'gemini-2.0-flash',
+  advanced: process.env.GEMINI_ADVANCED_MODEL || 'gemini-2.0-flash',
+  security: process.env.GEMINI_SECURITY_MODEL || 'gemini-2.0-flash'
 };
+
+const GEMINI_FALLBACK_MODELS = [
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+  'gemini-1.5-flash',
+  'gemini-1.5-flash-8b',
+  'gemini-1.5-pro'
+];
 
 const AGENT_MASTER_PROMPT = `You are AgentMan — an agentic backend engine for a Postman-like API IDE.
 You receive structured context about the user's current HTTP request and last response,
@@ -346,11 +354,39 @@ function parseOpenRouterModel(model) {
 }
 
 function parseGeminiModel(model, profile = 'default') {
-  const allowed = new Set([GEMINI_MODELS.default, GEMINI_MODELS.advanced, GEMINI_MODELS.security]);
-  if (typeof model === 'string' && allowed.has(model)) return model;
+  if (typeof model === 'string' && model.trim()) return model.trim().replace(/^models\//, '');
   if (profile === 'security') return GEMINI_MODELS.security;
   if (profile === 'advanced') return GEMINI_MODELS.advanced;
   return GEMINI_MODELS.default;
+}
+
+function buildGeminiModelCandidates(requestedModel, profile = 'default') {
+  const preferred = parseGeminiModel(requestedModel, profile);
+  const envCandidates = [GEMINI_MODELS.default, GEMINI_MODELS.advanced, GEMINI_MODELS.security]
+    .map(x => parseGeminiModel(x, profile));
+  const fallbackCandidates = GEMINI_FALLBACK_MODELS.map(x => parseGeminiModel(x, profile));
+  const ordered = [preferred, ...envCandidates, ...fallbackCandidates].filter(Boolean);
+  return [...new Set(ordered)];
+}
+
+function extractGeminiText(data) {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  const text = Array.isArray(parts)
+    ? parts
+      .map(part => (part && typeof part.text === 'string' ? part.text : ''))
+      .join('')
+      .trim()
+    : '';
+  return text;
+}
+
+function isGeminiRetryableModelError(status, message) {
+  const msg = String(message || '').toLowerCase();
+  return status === 404
+    || msg.includes('not found')
+    || msg.includes('not supported')
+    || msg.includes('unsupported')
+    || msg.includes('models/');
 }
 
 async function openRouterGenerateJson({ model, systemPrompt, userContent, temperature = 0.2, maxTokens = 1000 }) {
@@ -412,59 +448,77 @@ async function openRouterGenerateJson({ model, systemPrompt, userContent, temper
 async function geminiGenerateJson({ model, profile = 'default', systemPrompt, userContent, temperature = 0.2, maxTokens = 1000 }) {
   assertApiKeyConfigured(MODEL_PROVIDERS.gemini);
 
-  const geminiModel = parseGeminiModel(model, profile);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      systemInstruction: {
-        role: 'system',
-        parts: [{ text: systemPrompt }]
-      },
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: userContent }]
+  const apiVersions = ['v1beta', 'v1'];
+  const modelCandidates = buildGeminiModelCandidates(model, profile);
+  const mimeModes = [true, false];
+  let lastRetryableError = null;
+
+  for (const apiVersion of apiVersions) {
+    for (const candidateModel of modelCandidates) {
+      for (const withJsonMime of mimeModes) {
+        const url = `https://generativelanguage.googleapis.com/${apiVersion}/models/${encodeURIComponent(candidateModel)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+        const generationConfig = {
+          temperature,
+          maxOutputTokens: maxTokens
+        };
+        if (withJsonMime) generationConfig.responseMimeType = 'application/json';
+
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            systemInstruction: {
+              role: 'system',
+              parts: [{ text: systemPrompt }]
+            },
+            contents: [
+              {
+                role: 'user',
+                parts: [{ text: userContent }]
+              }
+            ],
+            generationConfig
+          })
+        });
+
+        let data;
+        try {
+          data = await response.json();
+        } catch {
+          const err = new Error('Gemini API returned a non-JSON response.');
+          err.status = 502;
+          throw err;
         }
-      ],
-      generationConfig: {
-        temperature,
-        maxOutputTokens: maxTokens,
-        responseMimeType: 'application/json'
+
+        if (!response.ok) {
+          const message = data?.error?.message || `Gemini API error (${response.status}).`;
+          if (isGeminiRetryableModelError(response.status, message)) {
+            const err = new Error(message);
+            err.status = response.status;
+            lastRetryableError = err;
+            continue;
+          }
+          const err = new Error(message);
+          err.status = response.status;
+          throw err;
+        }
+
+        const text = extractGeminiText(data);
+        if (text) return text;
+
+        const err = new Error('Gemini API returned an unexpected content shape.');
+        err.status = 502;
+        throw err;
       }
-    })
-  });
-
-  let data;
-  try {
-    data = await response.json();
-  } catch {
-    const err = new Error('Gemini API returned a non-JSON response.');
-    err.status = 502;
-    throw err;
+    }
   }
 
-  if (!response.ok) {
-    const err = new Error(data?.error?.message || `Gemini API error (${response.status}).`);
-    err.status = response.status;
-    throw err;
-  }
-
-  const parts = data?.candidates?.[0]?.content?.parts;
-  const text = Array.isArray(parts)
-    ? parts
-      .map(part => (part && typeof part.text === 'string' ? part.text : ''))
-      .join('')
-      .trim()
-    : '';
-
-  if (text) return text;
-
-  const err = new Error('Gemini API returned an unexpected content shape.');
-  err.status = 502;
+  const err = new Error(
+    `Gemini model was unavailable across fallback attempts. Tried models: ${modelCandidates.join(', ')}. ${lastRetryableError ? `Last error: ${lastRetryableError.message}` : ''}`
+  );
+  err.status = Number(lastRetryableError?.status || 502);
   throw err;
 }
 

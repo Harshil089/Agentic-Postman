@@ -21,12 +21,13 @@ const OPENROUTER_MODELS = {
 };
 
 const GEMINI_MODELS = {
-  default: process.env.GEMINI_DEFAULT_MODEL || 'gemini-2.0-flash',
-  advanced: process.env.GEMINI_ADVANCED_MODEL || 'gemini-2.0-flash',
-  security: process.env.GEMINI_SECURITY_MODEL || 'gemini-2.0-flash'
+  default: process.env.GEMINI_DEFAULT_MODEL || 'gemini-flash-latest',
+  advanced: process.env.GEMINI_ADVANCED_MODEL || 'gemini-flash-latest',
+  security: process.env.GEMINI_SECURITY_MODEL || 'gemini-flash-latest'
 };
 
 const GEMINI_FALLBACK_MODELS = [
+  'gemini-flash-latest',
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
   'gemini-1.5-flash',
@@ -389,6 +390,16 @@ function isGeminiRetryableModelError(status, message) {
     || msg.includes('models/');
 }
 
+function isGeminiQuotaError(error) {
+  const status = Number(error?.status || 0);
+  const msg = String(error?.message || '').toLowerCase();
+  return status === 429
+    || msg.includes('quota exceeded')
+    || msg.includes('rate limit')
+    || msg.includes('billing')
+    || msg.includes('free_tier');
+}
+
 async function openRouterGenerateJson({ model, systemPrompt, userContent, temperature = 0.2, maxTokens = 1000 }) {
   assertApiKeyConfigured(MODEL_PROVIDERS.openrouter);
 
@@ -456,7 +467,7 @@ async function geminiGenerateJson({ model, profile = 'default', systemPrompt, us
   for (const apiVersion of apiVersions) {
     for (const candidateModel of modelCandidates) {
       for (const withJsonMime of mimeModes) {
-        const url = `https://generativelanguage.googleapis.com/${apiVersion}/models/${encodeURIComponent(candidateModel)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+        const url = `https://generativelanguage.googleapis.com/${apiVersion}/models/${encodeURIComponent(candidateModel)}:generateContent`;
         const generationConfig = {
           temperature,
           maxOutputTokens: maxTokens
@@ -466,7 +477,8 @@ async function geminiGenerateJson({ model, profile = 'default', systemPrompt, us
         const response = await fetch(url, {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'X-goog-api-key': GEMINI_API_KEY
           },
           body: JSON.stringify({
             systemInstruction: {
@@ -645,18 +657,33 @@ app.post('/api/agent', async (req, res) => {
 
     const systemPrompt = `${AGENT_MASTER_PROMPT}\n\n${MODE_RULES_PROMPT}\n\n${CONTEXT_AWARENESS_PROMPT}`;
     const userContent = JSON.stringify(context);
-    const raw = provider === MODEL_PROVIDERS.gemini
-      ? await geminiGenerateJson({
+    let raw;
+    if (provider === MODEL_PROVIDERS.gemini) {
+      try {
+        raw = await geminiGenerateJson({
           model,
           profile: 'default',
           systemPrompt,
           userContent
-        })
-      : await openRouterGenerateJson({
-          model,
-          systemPrompt,
-          userContent
         });
+      } catch (error) {
+        if (isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
+          raw = await openRouterGenerateJson({
+            model: OPENROUTER_MODELS.default,
+            systemPrompt,
+            userContent
+          });
+        } else {
+          throw error;
+        }
+      }
+    } else {
+      raw = await openRouterGenerateJson({
+        model,
+        systemPrompt,
+        userContent
+      });
+    }
 
     const payload = parseAgentPayload(raw);
     return res.json(payload);
@@ -685,18 +712,33 @@ app.post('/api/assertions', async (req, res) => {
 
     const systemPrompt = 'You are an API testing assistant. Return strict JSON only.';
     const userContent = JSON.stringify(instruction);
-    const raw = provider === MODEL_PROVIDERS.gemini
-      ? await geminiGenerateJson({
+    let raw;
+    if (provider === MODEL_PROVIDERS.gemini) {
+      try {
+        raw = await geminiGenerateJson({
           model,
           profile: 'default',
           systemPrompt,
           userContent
-        })
-      : await openRouterGenerateJson({
-          model,
-          systemPrompt,
-          userContent
         });
+      } catch (error) {
+        if (isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
+          raw = await openRouterGenerateJson({
+            model: OPENROUTER_MODELS.default,
+            systemPrompt,
+            userContent
+          });
+        } else {
+          throw error;
+        }
+      }
+    } else {
+      raw = await openRouterGenerateJson({
+        model,
+        systemPrompt,
+        userContent
+      });
+    }
 
     let parsed;
     try {
@@ -736,23 +778,41 @@ app.post('/api/security-agent', async (req, res) => {
       return res.status(400).json({ error: 'Missing security context object.' });
     }
 
-    const raw = provider === MODEL_PROVIDERS.gemini
-      ? await geminiGenerateJson({
+    let raw;
+    if (provider === MODEL_PROVIDERS.gemini) {
+      try {
+        raw = await geminiGenerateJson({
           model,
           profile: 'security',
           systemPrompt: SECURITY_MASTER_PROMPT,
           userContent: JSON.stringify(context),
           temperature: 0.1,
           maxTokens: 1200
-        })
-      : await openRouterGenerateJsonWithFallback({
-          model,
-          systemPrompt: SECURITY_MASTER_PROMPT,
-          userContent: JSON.stringify(context),
-          temperature: 0.1,
-          maxTokens: 1400,
-          fallbackTokens: [1200, 1000, 800, 600]
         });
+      } catch (error) {
+        if (isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
+          raw = await openRouterGenerateJsonWithFallback({
+            model: OPENROUTER_MODELS.security,
+            systemPrompt: SECURITY_MASTER_PROMPT,
+            userContent: JSON.stringify(context),
+            temperature: 0.1,
+            maxTokens: 1400,
+            fallbackTokens: [1200, 1000, 800, 600]
+          });
+        } else {
+          throw error;
+        }
+      }
+    } else {
+      raw = await openRouterGenerateJsonWithFallback({
+        model,
+        systemPrompt: SECURITY_MASTER_PROMPT,
+        userContent: JSON.stringify(context),
+        temperature: 0.1,
+        maxTokens: 1400,
+        fallbackTokens: [1200, 1000, 800, 600]
+      });
+    }
 
     const payload = parseSecurityPayload(raw);
     return res.json(payload);

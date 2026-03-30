@@ -8,10 +8,12 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 
 const MODEL_PROVIDERS = {
   openrouter: 'openrouter',
-  gemini: 'gemini'
+  gemini: 'gemini',
+  groq: 'groq'
 };
 
 const OPENROUTER_MODELS = {
@@ -33,6 +35,30 @@ const GEMINI_FALLBACK_MODELS = [
   'gemini-1.5-flash',
   'gemini-1.5-flash-8b',
   'gemini-1.5-pro'
+];
+
+const GROQ_MODEL_ALIASES = {
+  'groq/compound': 'groq/compound',
+  'groq/compound-mini': 'groq/compound-mini',
+  'groq/gpt-oss-120b': 'openai/gpt-oss-120b',
+  'groq/gpt-oss-20b': 'openai/gpt-oss-20b',
+  'groq/gpt-oss-safeguard-20b': 'openai/gpt-oss-safeguard-20b',
+  'groq/qwen3-32b': 'qwen/qwen3-32b'
+};
+
+const GROQ_MODELS = {
+  default: 'groq/gpt-oss-120b',
+  advanced: 'groq/gpt-oss-120b',
+  security: 'groq/gpt-oss-safeguard-20b'
+};
+
+const GROQ_MODEL_ORDER = [
+  'groq/gpt-oss-120b',
+  'groq/gpt-oss-20b',
+  'groq/gpt-oss-safeguard-20b',
+  'groq/compound',
+  'groq/compound-mini',
+  'groq/qwen3-32b'
 ];
 
 const AGENT_MASTER_PROMPT = `You are AgentMan — an agentic backend engine for a Postman-like API IDE.
@@ -332,12 +358,18 @@ app.get('/', (_req, res) => {
 
 function parseProvider(providerRaw) {
   if (providerRaw === MODEL_PROVIDERS.gemini) return MODEL_PROVIDERS.gemini;
+  if (providerRaw === MODEL_PROVIDERS.groq) return MODEL_PROVIDERS.groq;
   return MODEL_PROVIDERS.openrouter;
 }
 
 function assertApiKeyConfigured(provider) {
   if (provider === MODEL_PROVIDERS.gemini && !GEMINI_API_KEY) {
     const err = new Error('Server is missing GEMINI_API_KEY. Add it to .env.');
+    err.status = 500;
+    throw err;
+  }
+  if (provider === MODEL_PROVIDERS.groq && !GROQ_API_KEY) {
+    const err = new Error('Server is missing GROQ_API_KEY. Add it to .env.');
     err.status = 500;
     throw err;
   }
@@ -368,6 +400,36 @@ function buildGeminiModelCandidates(requestedModel, profile = 'default') {
   const fallbackCandidates = GEMINI_FALLBACK_MODELS.map(x => parseGeminiModel(x, profile));
   const ordered = [preferred, ...envCandidates, ...fallbackCandidates].filter(Boolean);
   return [...new Set(ordered)];
+}
+
+function parseGroqModel(model, profile = 'default') {
+  const requested = typeof model === 'string' ? model.trim() : '';
+  if (requested && GROQ_MODEL_ALIASES[requested]) {
+    return GROQ_MODEL_ALIASES[requested];
+  }
+
+  const aliasValues = Object.values(GROQ_MODEL_ALIASES);
+  if (requested && aliasValues.includes(requested)) {
+    return requested;
+  }
+
+  const profileAlias = profile === 'security'
+    ? GROQ_MODELS.security
+    : profile === 'advanced'
+      ? GROQ_MODELS.advanced
+      : GROQ_MODELS.default;
+  return GROQ_MODEL_ALIASES[profileAlias] || GROQ_MODEL_ALIASES[GROQ_MODELS.default];
+}
+
+function buildGroqModelCandidates(requestedModel, profile = 'default', allowModelFallback = true) {
+  const preferred = parseGroqModel(requestedModel, profile);
+  if (!allowModelFallback) {
+    return preferred ? [preferred] : [];
+  }
+  const orderedResolved = GROQ_MODEL_ORDER
+    .map(alias => GROQ_MODEL_ALIASES[alias])
+    .filter(Boolean);
+  return [...new Set([preferred, ...orderedResolved].filter(Boolean))];
 }
 
 function extractGeminiText(data) {
@@ -534,6 +596,119 @@ async function geminiGenerateJson({ model, profile = 'default', systemPrompt, us
   throw err;
 }
 
+async function groqGenerateJson({ model, systemPrompt, userContent, temperature = 0.2, maxTokens = 1000 }) {
+  assertApiKeyConfigured(MODEL_PROVIDERS.groq);
+
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${GROQ_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: model || GROQ_MODELS.default,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContent }
+      ],
+      temperature,
+      max_tokens: maxTokens,
+      response_format: { type: 'json_object' }
+    })
+  });
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    const err = new Error('Groq API returned a non-JSON response.');
+    err.status = 502;
+    throw err;
+  }
+
+  if (!response.ok) {
+    const err = new Error(data?.error?.message || `Groq API error (${response.status}).`);
+    err.status = response.status;
+    throw err;
+  }
+
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content === 'string' && content.trim()) return content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map(part => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part.text === 'string') return part.text;
+        return '';
+      })
+      .join('');
+    if (text.trim()) return text;
+  }
+
+  const err = new Error('Groq API returned an unexpected content shape.');
+  err.status = 502;
+  throw err;
+}
+
+function isGroqTokenBudgetError(error) {
+  const msg = String(error?.message || '').toLowerCase();
+  return msg.includes('requires more credits')
+    || msg.includes('fewer max_tokens')
+    || msg.includes('can only afford');
+}
+
+function isGroqRetryableModelError(error) {
+  const msg = String(error?.message || '').toLowerCase();
+  return msg.includes('decommissioned')
+    || msg.includes('not found')
+    || msg.includes('blocked at the project level')
+    || msg.includes('failed to validate json')
+    || msg.includes('json_validate_failed');
+}
+
+async function groqGenerateJsonWithFallback({
+  model,
+  profile = 'default',
+  allowModelFallback = true,
+  systemPrompt,
+  userContent,
+  temperature = 0.2,
+  maxTokens = 1000,
+  fallbackTokens = [800, 600, 500, 400, 300, 200]
+}) {
+  const modelCandidates = buildGroqModelCandidates(model, profile, allowModelFallback);
+  const tried = new Set();
+  const tokenPlan = [maxTokens, ...fallbackTokens].filter(x => Number.isFinite(x) && x > 0);
+  let lastError;
+
+  for (const candidateModel of modelCandidates) {
+    for (const tokens of tokenPlan) {
+      const key = `${candidateModel}::${tokens}`;
+      if (tried.has(key)) continue;
+      tried.add(key);
+
+      try {
+        return await groqGenerateJson({
+          model: candidateModel,
+          systemPrompt,
+          userContent,
+          temperature,
+          maxTokens: tokens
+        });
+      } catch (error) {
+        lastError = error;
+        if (!isGroqTokenBudgetError(error)) {
+          if (!isGroqRetryableModelError(error)) {
+            throw error;
+          }
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error('Groq request failed after token fallback attempts.');
+}
+
 async function openRouterGenerateJsonWithFallback({
   model,
   systemPrompt,
@@ -649,6 +824,7 @@ app.post('/api/agent', async (req, res) => {
   try {
     const context = req.body?.context;
     const model = req.body?.model;
+    const hasExplicitGroqModel = typeof model === 'string' && model.trim().length > 0;
     const provider = parseProvider(req.body?.provider);
 
     if (!context || typeof context !== 'object') {
@@ -658,6 +834,7 @@ app.post('/api/agent', async (req, res) => {
     const systemPrompt = `${AGENT_MASTER_PROMPT}\n\n${MODE_RULES_PROMPT}\n\n${CONTEXT_AWARENESS_PROMPT}`;
     const userContent = JSON.stringify(context);
     let raw;
+    
     if (provider === MODEL_PROVIDERS.gemini) {
       try {
         raw = await geminiGenerateJson({
@@ -677,6 +854,16 @@ app.post('/api/agent', async (req, res) => {
           throw error;
         }
       }
+    } else if (provider === MODEL_PROVIDERS.groq) {
+      raw = await groqGenerateJsonWithFallback({
+        model: model || GROQ_MODELS.default,
+        profile: 'default',
+        allowModelFallback: !hasExplicitGroqModel,
+        systemPrompt,
+        userContent,
+        maxTokens: 1000,
+        fallbackTokens: [800, 600, 500, 400, 300, 200]
+      });
     } else {
       raw = await openRouterGenerateJson({
         model,
@@ -698,6 +885,7 @@ app.post('/api/assertions', async (req, res) => {
     const status = req.body?.status;
     const bodyPreview = req.body?.body_preview;
     const model = req.body?.model;
+    const hasExplicitGroqModel = typeof model === 'string' && model.trim().length > 0;
     const provider = parseProvider(req.body?.provider);
 
     if (typeof status !== 'number') {
@@ -713,6 +901,7 @@ app.post('/api/assertions', async (req, res) => {
     const systemPrompt = 'You are an API testing assistant. Return strict JSON only.';
     const userContent = JSON.stringify(instruction);
     let raw;
+    
     if (provider === MODEL_PROVIDERS.gemini) {
       try {
         raw = await geminiGenerateJson({
@@ -732,6 +921,16 @@ app.post('/api/assertions', async (req, res) => {
           throw error;
         }
       }
+    } else if (provider === MODEL_PROVIDERS.groq) {
+      raw = await groqGenerateJsonWithFallback({
+        model: model || GROQ_MODELS.default,
+        profile: 'default',
+        allowModelFallback: !hasExplicitGroqModel,
+        systemPrompt,
+        userContent,
+        maxTokens: 800,
+        fallbackTokens: [600, 500, 400, 300, 200]
+      });
     } else {
       raw = await openRouterGenerateJson({
         model,
@@ -761,7 +960,13 @@ app.post('/api/assertions', async (req, res) => {
 app.post('/api/security-agent', async (req, res) => {
   try {
     const provider = parseProvider(req.body?.provider);
-    const model = req.body?.model || (provider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.security : OPENROUTER_MODELS.security);
+    const requestedModel = req.body?.model;
+    const hasExplicitGroqModel = typeof requestedModel === 'string' && requestedModel.trim().length > 0;
+    const model = requestedModel || (
+      provider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.security :
+      provider === MODEL_PROVIDERS.groq ? GROQ_MODELS.security :
+      OPENROUTER_MODELS.security
+    );
     const bodyContext = req.body?.context;
     const context = bodyContext && typeof bodyContext === 'object'
       ? bodyContext
@@ -803,6 +1008,17 @@ app.post('/api/security-agent', async (req, res) => {
           throw error;
         }
       }
+    } else if (provider === MODEL_PROVIDERS.groq) {
+      raw = await groqGenerateJsonWithFallback({
+        model: model || GROQ_MODELS.security,
+        profile: 'security',
+        allowModelFallback: !hasExplicitGroqModel,
+        systemPrompt: SECURITY_MASTER_PROMPT,
+        userContent: JSON.stringify(context),
+        temperature: 0.1,
+        maxTokens: 800,
+        fallbackTokens: [600, 500, 400, 300, 200]
+      });
     } else {
       raw = await openRouterGenerateJsonWithFallback({
         model,
@@ -892,7 +1108,8 @@ app.get('/api/health', (_req, res) => {
     model_security: OPENROUTER_MODELS.security,
     providers: {
       openrouter: Boolean(OPENROUTER_API_KEY),
-      gemini: Boolean(GEMINI_API_KEY)
+      gemini: Boolean(GEMINI_API_KEY),
+      groq: Boolean(GROQ_API_KEY)
     }
   });
 });

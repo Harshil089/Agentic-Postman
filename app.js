@@ -8,9 +8,23 @@ const GEMINI_MODELS = {
   advanced: 'gemini-1.5-flash',
   security: 'gemini-1.5-flash'
 };
+const GROQ_MODELS = {
+  default: 'groq/gpt-oss-120b',
+  advanced: 'groq/gpt-oss-120b',
+  security: 'groq/gpt-oss-safeguard-20b'
+};
+const GROQ_MODEL_OPTIONS = [
+  'groq/compound',
+  'groq/compound-mini',
+  'groq/gpt-oss-120b',
+  'groq/gpt-oss-20b',
+  'groq/gpt-oss-safeguard-20b',
+  'groq/qwen3-32b'
+];
 const MODEL_PROVIDERS = {
   openrouter: 'openrouter',
-  gemini: 'gemini'
+  gemini: 'gemini',
+  groq: 'groq'
 };
 const BACKEND_ENDPOINTS = {
   agent: '/api/agent',
@@ -41,6 +55,7 @@ let lastResponse = null;
 let idCounter = 3;
 let agentMode = 'agent';
 let selectedModelProvider = MODEL_PROVIDERS.openrouter;
+let selectedGroqModel = GROQ_MODELS.default;
 let chatSessionId = 1;
 let chatGoal = '';
 let conversationHistory = [];
@@ -185,11 +200,30 @@ function renderAgentMode() {
 }
 
 function renderModelProvider() {
-  const switchEl = document.getElementById('provider-switch');
-  if (!switchEl) return;
-  switchEl.querySelectorAll('.provider-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.provider === selectedModelProvider);
-  });
+  const selectEl = document.getElementById('model-provider-select');
+  const groqSelectEl = document.getElementById('groq-model-select');
+  const groqRowEl = document.getElementById('groq-model-row');
+  if (!selectEl) return;
+  selectEl.value = selectedModelProvider;
+  if (groqSelectEl) {
+    if (!GROQ_MODEL_OPTIONS.includes(selectedGroqModel)) {
+      selectedGroqModel = GROQ_MODELS.default;
+    }
+    groqSelectEl.value = selectedGroqModel;
+  }
+  if (groqRowEl) {
+    groqRowEl.style.display = selectedModelProvider === MODEL_PROVIDERS.groq ? 'flex' : 'none';
+  }
+  
+  const statusText = document.getElementById('provider-status-text');
+  if (statusText) {
+    const labels = {
+      openrouter: 'OpenRouter',
+      gemini: 'Gemini',
+      groq: 'Groq'
+    };
+    statusText.textContent = labels[selectedModelProvider] || 'OpenRouter';
+  }
 }
 
 function setModelProvider(provider) {
@@ -200,8 +234,24 @@ function setModelProvider(provider) {
   }
   selectedModelProvider = provider;
   renderModelProvider();
-  const label = provider === MODEL_PROVIDERS.gemini ? 'Gemini' : 'OpenRouter';
-  addAgentMsg('system', `Model provider switched to ${label}.`);
+  const labels = {
+    openrouter: 'OpenRouter',
+    gemini: 'Gemini',
+    groq: 'Groq'
+  };
+  addAgentMsg('system', `Model provider switched to ${labels[provider]}.`);
+}
+
+function setGroqModel(model) {
+  if (!GROQ_MODEL_OPTIONS.includes(model)) return;
+  if (agentRunState.isRunning) {
+    addAgentMsg('system', 'Stop the current run before switching Groq model.');
+    renderModelProvider();
+    return;
+  }
+  selectedGroqModel = model;
+  renderModelProvider();
+  addAgentMsg('system', `Groq model switched to ${model}.`);
 }
 
 function setAgentMode(mode) {
@@ -958,14 +1008,17 @@ async function autoSuggestAssertions() {
       status: lastResponse.status,
       body_preview: preview,
       provider: selectedModelProvider,
-      model: selectedModelProvider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.default : OPENROUTER_MODELS.default
+      model: selectedModelProvider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.default :
+              selectedModelProvider === MODEL_PROVIDERS.groq ? selectedGroqModel :
+             OPENROUTER_MODELS.default
     });
     const arr = Array.isArray(parsed?.assertions) ? parsed.assertions : [];
     if (!arr.length) return;
     const r = getActive();
     r.assertions = arr.map(expr => ({ expr, status: 'pending' }));
     renderAssertions(r.assertions);
-    addAgentMsg('system', `Generated ${arr.length} assertions. Run the request again to execute them, or switch to the Assertions tab.`);
+    switchTab('assertions');
+    addAgentMsg('system', `Generated ${arr.length} assertions. Check the Assertions tab to review and run them.`);
   } catch {}
 }
 
@@ -995,6 +1048,9 @@ function buildUserContext(req, resp, userMsg) {
 function pickAgentModel(userMsg) {
   if (selectedModelProvider === MODEL_PROVIDERS.gemini) {
     return GEMINI_MODELS.default;
+  }
+  if (selectedModelProvider === MODEL_PROVIDERS.groq) {
+    return selectedGroqModel;
   }
   const msg = (userMsg || '').toLowerCase();
   if (msg.includes('complex debug') || (msg.includes('debug') && msg.includes('chain'))) {
@@ -1485,7 +1541,9 @@ function shortenUrl(url) {
 
 async function callSecurityAgent(targetUrl, currentRequest, lastResponseData, authContext, testHistory, userInstruction, options = {}) {
   const provider = selectedModelProvider;
-  const model = provider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.security : OPENROUTER_MODELS.security;
+  const model = provider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.security :
+                provider === MODEL_PROVIDERS.groq ? selectedGroqModel :
+                OPENROUTER_MODELS.security;
   return callBackendJson(BACKEND_ENDPOINTS.securityAgent, {
     provider,
     context: {

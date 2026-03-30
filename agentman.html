@@ -18,7 +18,7 @@
   <div class="topbar-spacer"></div>
   <div class="status-pill">
     <div class="status-dot"></div>
-    OpenRouter
+    <span id="provider-status-text">OpenRouter</span>
   </div>
 </div>
 
@@ -149,10 +149,24 @@
         <button class="quick-btn" onclick="startNewChat()">✦ New Chat</button>
       </div>
       <div class="provider-toolbar">
-        <span class="provider-label">Model</span>
-        <div class="provider-switch" id="provider-switch">
-          <button class="provider-btn active" data-provider="openrouter" onclick="setModelProvider('openrouter')">OpenRouter</button>
-          <button class="provider-btn" data-provider="gemini" onclick="setModelProvider('gemini')">Gemini</button>
+        <div class="model-select-row">
+          <label for="model-provider-select" class="provider-label">Provider</label>
+          <select class="model-provider-select" id="model-provider-select" onchange="setModelProvider(this.value)">
+            <option value="openrouter">OpenRouter</option>
+            <option value="gemini">Gemini</option>
+            <option value="groq">Groq</option>
+          </select>
+        </div>
+        <div class="model-select-row" id="groq-model-row" style="display:none;">
+          <label for="groq-model-select" class="provider-label">Groq Model</label>
+          <select class="model-provider-select" id="groq-model-select" onchange="setGroqModel(this.value)">
+            <option value="groq/compound">groq/compound</option>
+            <option value="groq/compound-mini">groq/compound-mini</option>
+            <option value="groq/gpt-oss-120b">groq/gpt-oss-120b</option>
+            <option value="groq/gpt-oss-20b">groq/gpt-oss-20b</option>
+            <option value="groq/gpt-oss-safeguard-20b">groq/gpt-oss-safeguard-20b</option>
+            <option value="groq/qwen3-32b">groq/qwen3-32b</option>
+          </select>
         </div>
       </div>
       <textarea class="agent-textarea" id="agent-input" placeholder="Describe a request, ask to debug, chain, or generate assertions..." rows="3"></textarea>

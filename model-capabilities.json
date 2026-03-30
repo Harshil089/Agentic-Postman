@@ -1,0 +1,110 @@
+{
+  "openrouter/auto": {
+    "provider": "openrouter",
+    "jsonReliability": 0.9,
+    "maxContext": 128000,
+    "costTier": 2,
+    "rateLimits": { "rpm": 60, "tpm": 90000 },
+    "securityScanQuality": 0.72,
+    "taskFit": { "agent": 0.88, "assertions": 0.85, "security": 0.7 }
+  },
+  "openai/gpt-4o-mini": {
+    "provider": "openrouter",
+    "jsonReliability": 0.93,
+    "maxContext": 128000,
+    "costTier": 2,
+    "rateLimits": { "rpm": 80, "tpm": 100000 },
+    "securityScanQuality": 0.78,
+    "taskFit": { "agent": 0.9, "assertions": 0.92, "security": 0.75 }
+  },
+  "openai/gpt-4o": {
+    "provider": "openrouter",
+    "jsonReliability": 0.95,
+    "maxContext": 128000,
+    "costTier": 4,
+    "rateLimits": { "rpm": 40, "tpm": 80000 },
+    "securityScanQuality": 0.9,
+    "taskFit": { "agent": 0.9, "assertions": 0.86, "security": 0.95 }
+  },
+  "gemini-flash-latest": {
+    "provider": "gemini",
+    "jsonReliability": 0.89,
+    "maxContext": 1000000,
+    "costTier": 1,
+    "rateLimits": { "rpm": 60, "tpm": 120000 },
+    "securityScanQuality": 0.7,
+    "taskFit": { "agent": 0.88, "assertions": 0.9, "security": 0.68 }
+  },
+  "gemini-2.0-flash": {
+    "provider": "gemini",
+    "jsonReliability": 0.9,
+    "maxContext": 1000000,
+    "costTier": 1,
+    "rateLimits": { "rpm": 60, "tpm": 120000 },
+    "securityScanQuality": 0.72,
+    "taskFit": { "agent": 0.89, "assertions": 0.9, "security": 0.7 }
+  },
+  "gemini-1.5-pro": {
+    "provider": "gemini",
+    "jsonReliability": 0.94,
+    "maxContext": 2000000,
+    "costTier": 3,
+    "rateLimits": { "rpm": 30, "tpm": 80000 },
+    "securityScanQuality": 0.84,
+    "taskFit": { "agent": 0.92, "assertions": 0.88, "security": 0.84 }
+  },
+  "groq/compound": {
+    "provider": "groq",
+    "jsonReliability": 0.87,
+    "maxContext": 64000,
+    "costTier": 3,
+    "rateLimits": { "rpm": 60, "tpm": 60000 },
+    "securityScanQuality": 0.86,
+    "taskFit": { "agent": 0.85, "assertions": 0.8, "security": 0.88 }
+  },
+  "groq/compound-mini": {
+    "provider": "groq",
+    "jsonReliability": 0.85,
+    "maxContext": 32000,
+    "costTier": 1,
+    "rateLimits": { "rpm": 90, "tpm": 70000 },
+    "securityScanQuality": 0.8,
+    "taskFit": { "agent": 0.82, "assertions": 0.88, "security": 0.75 }
+  },
+  "openai/gpt-oss-120b": {
+    "provider": "groq",
+    "jsonReliability": 0.91,
+    "maxContext": 131072,
+    "costTier": 3,
+    "rateLimits": { "rpm": 30, "tpm": 30000 },
+    "securityScanQuality": 0.88,
+    "taskFit": { "agent": 0.93, "assertions": 0.88, "security": 0.9 }
+  },
+  "openai/gpt-oss-20b": {
+    "provider": "groq",
+    "jsonReliability": 0.86,
+    "maxContext": 131072,
+    "costTier": 1,
+    "rateLimits": { "rpm": 80, "tpm": 70000 },
+    "securityScanQuality": 0.74,
+    "taskFit": { "agent": 0.8, "assertions": 0.9, "security": 0.7 }
+  },
+  "openai/gpt-oss-safeguard-20b": {
+    "provider": "groq",
+    "jsonReliability": 0.9,
+    "maxContext": 32768,
+    "costTier": 2,
+    "rateLimits": { "rpm": 60, "tpm": 50000 },
+    "securityScanQuality": 0.96,
+    "taskFit": { "agent": 0.75, "assertions": 0.78, "security": 0.97 }
+  },
+  "qwen/qwen3-32b": {
+    "provider": "groq",
+    "jsonReliability": 0.84,
+    "maxContext": 32768,
+    "costTier": 1,
+    "rateLimits": { "rpm": 70, "tpm": 60000 },
+    "securityScanQuality": 0.76,
+    "taskFit": { "agent": 0.79, "assertions": 0.86, "security": 0.72 }
+  }
+}

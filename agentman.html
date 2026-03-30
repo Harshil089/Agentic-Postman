@@ -26,9 +26,21 @@
 
   <!-- SIDEBAR -->
   <div class="sidebar">
+    <div class="sidebar-nav" id="sidebar-nav">
+      <button class="sidebar-window-btn active" data-window="requests" onclick="setSidebarWindow('requests')" title="Requests">
+        <span class="sidebar-window-icon">R</span>
+        <span class="sidebar-window-label">Requests</span>
+      </button>
+      <button class="sidebar-window-btn" data-window="errors" onclick="setSidebarWindow('errors')" title="Errors">
+        <span class="sidebar-window-icon">E</span>
+        <span class="sidebar-window-label">Errors</span>
+        <span class="sidebar-window-badge" id="errors-count-badge">0</span>
+      </button>
+    </div>
     <div class="sidebar-header">
-      <span class="sidebar-title">Requests</span>
+      <span class="sidebar-title" id="sidebar-title">Requests</span>
       <button class="icon-btn" id="new-req-btn" title="New request">+</button>
+      <button class="icon-btn" id="clear-errors-btn" title="Clear errors" style="display:none;">×</button>
     </div>
     <div class="sidebar-list" id="sidebar-list"></div>
   </div>
@@ -166,6 +178,16 @@
             <option value="groq/gpt-oss-20b">groq/gpt-oss-20b</option>
             <option value="groq/gpt-oss-safeguard-20b">groq/gpt-oss-safeguard-20b</option>
             <option value="groq/qwen3-32b">groq/qwen3-32b</option>
+          </select>
+        </div>
+        <div class="model-select-row" id="scan-pace-row">
+          <label for="scan-pace-select" class="provider-label">Scan Pace</label>
+          <select class="model-provider-select" id="scan-pace-select" onchange="setScanPace(this.value)">
+            <option value="0">No delay</option>
+            <option value="2000">2s</option>
+            <option value="5000">5s</option>
+            <option value="8000">8s</option>
+            <option value="adaptive">Adaptive</option>
           </select>
         </div>
       </div>

@@ -61,6 +61,10 @@ let chatGoal = '';
 let conversationHistory = [];
 let securityTestHistory = [];
 let securityThreatLevel = 'none';
+let activeSidebarWindow = 'requests';
+let errorLogEntries = [];
+let scanPaceSetting = '0';
+let adaptiveScanPacingMs = 2000;
 const scanProgressState = {
   active: false,
   status: 'idle',
@@ -95,8 +99,13 @@ const AGENT_MODE_META = {
 
 const STORAGE_KEYS = {
   provider: 'agentman:modelProvider',
-  groqModel: 'agentman:groqModel'
+  groqModel: 'agentman:groqModel',
+  sidebarWindow: 'agentman:sidebarWindow',
+  scanPaceMs: 'agentman:scanPaceMs',
+  scanPaceSetting: 'agentman:scanPaceSetting'
 };
+
+const SCAN_PACE_VALUES = new Set(['0', '2000', '5000', '8000', 'adaptive']);
 
 function loadModelPreferences() {
   try {
@@ -109,6 +118,21 @@ function loadModelPreferences() {
     if (GROQ_MODEL_OPTIONS.includes(storedGroqModel)) {
       selectedGroqModel = storedGroqModel;
     }
+
+    const storedSidebarWindow = localStorage.getItem(STORAGE_KEYS.sidebarWindow);
+    if (storedSidebarWindow === 'requests' || storedSidebarWindow === 'errors') {
+      activeSidebarWindow = storedSidebarWindow;
+    }
+
+    const storedScanPaceSetting = localStorage.getItem(STORAGE_KEYS.scanPaceSetting);
+    if (SCAN_PACE_VALUES.has(storedScanPaceSetting)) {
+      scanPaceSetting = storedScanPaceSetting;
+    } else {
+      const storedScanPaceMs = Number(localStorage.getItem(STORAGE_KEYS.scanPaceMs));
+      if (Number.isFinite(storedScanPaceMs) && SCAN_PACE_VALUES.has(String(storedScanPaceMs))) {
+        scanPaceSetting = String(storedScanPaceMs);
+      }
+    }
   } catch {}
 }
 
@@ -116,13 +140,66 @@ function saveModelPreferences() {
   try {
     localStorage.setItem(STORAGE_KEYS.provider, selectedModelProvider);
     localStorage.setItem(STORAGE_KEYS.groqModel, selectedGroqModel);
+    localStorage.setItem(STORAGE_KEYS.scanPaceMs, scanPaceSetting === 'adaptive' ? String(adaptiveScanPacingMs) : scanPaceSetting);
+    localStorage.setItem(STORAGE_KEYS.scanPaceSetting, scanPaceSetting);
   } catch {}
+}
+
+function getCurrentScanPacingMs() {
+  if (scanPaceSetting === 'adaptive') return adaptiveScanPacingMs;
+  const fixed = Number(scanPaceSetting);
+  return Number.isFinite(fixed) ? fixed : 0;
+}
+
+function bumpAdaptiveScanPacing(delayHintMs = 0) {
+  if (scanPaceSetting !== 'adaptive') return;
+  const base = Math.max(2000, adaptiveScanPacingMs);
+  const hinted = Number.isFinite(delayHintMs) && delayHintMs > 0 ? Math.min(15000, Math.ceil(delayHintMs / 1000) * 1000) : base;
+  adaptiveScanPacingMs = Math.min(15000, Math.max(base + 1000, hinted));
+  saveModelPreferences();
+}
+
+function relaxAdaptiveScanPacing() {
+  if (scanPaceSetting !== 'adaptive') return;
+  adaptiveScanPacingMs = Math.max(2000, adaptiveScanPacingMs - 500);
+  saveModelPreferences();
+}
+
+function renderScanPaceControl() {
+  const selectEl = document.getElementById('scan-pace-select');
+  if (!selectEl) return;
+  if (!SCAN_PACE_VALUES.has(scanPaceSetting)) {
+    scanPaceSetting = '0';
+  }
+  selectEl.value = scanPaceSetting;
+}
+
+function setScanPace(msRaw) {
+  const normalized = String(msRaw || '').trim();
+  if (!SCAN_PACE_VALUES.has(normalized)) return;
+  scanPaceSetting = normalized;
+  if (scanPaceSetting === 'adaptive') {
+    adaptiveScanPacingMs = 2000;
+  }
+  saveModelPreferences();
+  renderScanPaceControl();
+  const label = scanPaceSetting === 'adaptive'
+    ? 'Adaptive (starts at 2s and auto-adjusts on rate limits)'
+    : Number(scanPaceSetting) === 0 ? 'No delay' : `${Math.round(Number(scanPaceSetting) / 1000)}s`;
+  addAgentMsg('system', `Scan pace set to ${label}.`, [], { track: false });
 }
 
 function getActive() { return requests.find(r => r.id === activeId); }
 
 function renderSidebar() {
+  renderSidebarWindowNav();
+  renderSidebarHeader();
+  if (activeSidebarWindow === 'errors') {
+    renderErrorSidebar();
+    return;
+  }
   const list = document.getElementById('sidebar-list');
+  if (!list) return;
   list.innerHTML = requests.map(r => `
     <div class="req-item ${r.id === activeId ? 'active' : ''}" onclick="selectRequest(${r.id})">
       <span class="method-badge m-${r.method}">${r.method}</span>
@@ -130,6 +207,87 @@ function renderSidebar() {
       ${r.chainOf ? `<span class="req-chain">⛓</span>` : ''}
     </div>
   `).join('');
+}
+
+function renderSidebarWindowNav() {
+  const nav = document.getElementById('sidebar-nav');
+  if (!nav) return;
+  nav.querySelectorAll('.sidebar-window-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.window === activeSidebarWindow);
+  });
+
+  const badge = document.getElementById('errors-count-badge');
+  if (badge) badge.textContent = String(errorLogEntries.length);
+}
+
+function renderSidebarHeader() {
+  const title = document.getElementById('sidebar-title');
+  const actionBtn = document.getElementById('new-req-btn');
+  const clearErrorsBtn = document.getElementById('clear-errors-btn');
+  if (title) {
+    title.textContent = activeSidebarWindow === 'errors' ? 'Errors' : 'Requests';
+  }
+  if (actionBtn) {
+    actionBtn.style.display = activeSidebarWindow === 'errors' ? 'none' : 'flex';
+  }
+  if (clearErrorsBtn) {
+    clearErrorsBtn.style.display = activeSidebarWindow === 'errors' ? 'flex' : 'none';
+  }
+}
+
+function renderErrorSidebar() {
+  const list = document.getElementById('sidebar-list');
+  if (!list) return;
+  if (!errorLogEntries.length) {
+    list.innerHTML = `<div class="error-empty">No errors logged yet.</div>`;
+    return;
+  }
+
+  list.innerHTML = errorLogEntries
+    .slice()
+    .reverse()
+    .map(entry => `
+      <div class="error-item">
+        <div class="error-item-header">
+          <span class="error-item-source">${escHtml(entry.source || 'error')}</span>
+          <span class="error-item-time">${escHtml(entry.time || '')}</span>
+        </div>
+        <div class="error-item-message">${escHtml(entry.message || '')}</div>
+      </div>
+    `)
+    .join('');
+}
+
+function setSidebarWindow(windowName) {
+  if (windowName !== 'requests' && windowName !== 'errors') return;
+  activeSidebarWindow = windowName;
+  try {
+    localStorage.setItem(STORAGE_KEYS.sidebarWindow, windowName);
+  } catch {}
+  renderSidebar();
+}
+
+function clearErrorLogs() {
+  errorLogEntries = [];
+  renderSidebar();
+  addAgentMsg('system', 'Cleared error log entries.', [], { track: false });
+}
+
+function logError(source, message) {
+  const msg = String(message || '').trim();
+  if (!msg) return;
+  errorLogEntries.push({
+    source: String(source || 'error'),
+    message: msg,
+    time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  });
+  if (errorLogEntries.length > 200) {
+    errorLogEntries = errorLogEntries.slice(-200);
+  }
+  renderSidebarWindowNav();
+  if (activeSidebarWindow === 'errors') {
+    renderErrorSidebar();
+  }
 }
 
 function selectRequest(id) {
@@ -485,6 +643,7 @@ async function sendRequest() {
     document.getElementById('response-body').innerHTML = `<span style="color:var(--red);">Error: ${e.message}</span>`;
     document.getElementById('status-tag').textContent = 'FAILED';
     document.getElementById('status-tag').className = 'status-tag s-4xx';
+    logError('request', `${r.method} ${r.url} - ${e.message}`);
     addAgentMsg('system', `Request failed: ${e.message}. Ask me to debug this error.`);
     return null;
   } finally {
@@ -517,6 +676,30 @@ function parseJsonSafely(text) {
   } catch {
     return null;
   }
+}
+
+function isRateLimitErrorMessage(message) {
+  const msg = String(message || '').toLowerCase();
+  return msg.includes('rate limit')
+    || msg.includes('tokens per minute')
+    || msg.includes('please try again in')
+    || msg.includes('quota');
+}
+
+function getRetryDelayMs(message) {
+  const raw = String(message || '');
+  const match = raw.match(/try again in\s*([0-9]+(?:\.[0-9]+)?)s/i);
+  if (match) {
+    const seconds = Number(match[1]);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return Math.min(30000, Math.ceil(seconds * 1000) + 300);
+    }
+  }
+  return 1800;
+}
+
+function waitMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function deriveAuthContext(headers) {
@@ -865,14 +1048,38 @@ async function generateProbeForScanStep(scanPlan, planStep) {
   ].join(' ');
 
   const context = buildSecurityContext(r, lastResponse, stepInstruction);
-  const raw = await callSecurityAgent(
-    context.target_url,
-    context.current_request,
-    context.last_response,
-    context.auth_context,
-    context.test_history,
-    context.user_instruction
-  );
+  let raw;
+  let lastRateError = null;
+  let hadRateLimit = false;
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      raw = await callSecurityAgent(
+        context.target_url,
+        context.current_request,
+        context.last_response,
+        context.auth_context,
+        context.test_history,
+        context.user_instruction
+      );
+      break;
+    } catch (error) {
+      const message = error?.message || 'Unknown error';
+      if (!isRateLimitErrorMessage(message) || attempt >= maxAttempts) {
+        throw error;
+      }
+      lastRateError = error;
+      const delayMs = getRetryDelayMs(message);
+      hadRateLimit = true;
+      bumpAdaptiveScanPacing(delayMs);
+      addAgentMsg('system', `Rate limit detected while generating probe for step ${planStep.order || '?'}. Retrying in ${Math.ceil(delayMs / 1000)}s...`, [], { track: false });
+      await waitMs(delayMs);
+    }
+  }
+
+  if (!raw && lastRateError) {
+    throw lastRateError;
+  }
 
   const parsed = parseSecurityPayload(raw);
   updateThreatLevel(parsed.threat_level);
@@ -880,9 +1087,9 @@ async function generateProbeForScanStep(scanPlan, planStep) {
 
   const actions = (parsed.actions || []).map(normalizeSecurityAction).filter(Boolean);
   const probe = actions.find(action => action.type === 'probe');
-  if (probe) return { probe, chain: null, message: parsed.message, assertions: actions.filter(a => a.type === 'set_assertions') };
+  if (probe) return { probe, chain: null, message: parsed.message, assertions: actions.filter(a => a.type === 'set_assertions'), hadRateLimit };
   const chain = actions.find(action => action.type === 'probe_chain');
-  return { probe: null, chain, message: parsed.message, assertions: actions.filter(a => a.type === 'set_assertions') };
+  return { probe: null, chain, message: parsed.message, assertions: actions.filter(a => a.type === 'set_assertions'), hadRateLimit };
 }
 
 async function executeScanPlan(scanPlan) {
@@ -910,12 +1117,28 @@ async function executeScanPlan(scanPlan) {
       return false;
     }
 
+    const stepDelayMs = i > 0 ? getCurrentScanPacingMs() : 0;
+    if (stepDelayMs > 0) {
+      const seconds = Math.round(stepDelayMs / 1000);
+      const modeLabel = scanPaceSetting === 'adaptive' ? 'adaptive' : 'fixed';
+      addAgentMsg('system', `Scan pacing (${modeLabel}): waiting ${seconds}s before step ${i + 1}.`, [], { track: false });
+      await waitMs(stepDelayMs);
+      if (agentRunState.stopRequested) {
+        addAgentMsg('system', 'Scan plan execution stopped by user.');
+        finalizeScanProgress('stopped', `Stopped at step ${i + 1}/${steps.length}`);
+        return false;
+      }
+    }
+
     updateScanProgressStep(i + 1, steps.length, planStep.vector || 'Unknown');
     addAgentMsg('system', `Preparing step ${planStep.order || '?'} (${planStep.vector || 'Unknown'}).`);
 
     let generated;
     try {
       generated = await generateProbeForScanStep(scanPlan, planStep);
+      if (scanPaceSetting === 'adaptive' && !generated.hadRateLimit) {
+        relaxAdaptiveScanPacing();
+      }
     } catch (error) {
       addAgentMsg('error', `Failed to generate probe for step ${planStep.order || '?'}: ${error.message}`);
       scanProgressState.failed += 1;
@@ -1198,6 +1421,10 @@ function addAgentMsg(role, text, chips = [], options = {}) {
   }
   el.appendChild(div);
   el.scrollTop = el.scrollHeight;
+  if (role === 'error') {
+    const plainText = String(text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    logError('agent', plainText || 'Agent error');
+  }
   if (track) recordConversationTurn(role, text);
   return div;
 }
@@ -1628,6 +1855,8 @@ document.getElementById('new-req-btn').addEventListener('click', () => {
   loadActive(); renderSidebar();
 });
 
+document.getElementById('clear-errors-btn').addEventListener('click', clearErrorLogs);
+
 // Copy response
 document.getElementById('copy-res-btn').addEventListener('click', () => {
   if (lastResponse?.text) navigator.clipboard.writeText(lastResponse.text);
@@ -1676,6 +1905,7 @@ loadModelPreferences();
 loadActive();
 renderSidebar();
 renderModelProvider();
+renderScanPaceControl();
 renderAgentMode();
 syncAgentRunControls();
 renderScanProgress();

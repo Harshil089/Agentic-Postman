@@ -93,6 +93,32 @@ const AGENT_MODE_META = {
   ask: { label: 'Ask', button: 'Ask ↗', placeholder: 'Ask API questions. Ask mode focuses on explanation, guidance, and debugging insights.' }
 };
 
+const STORAGE_KEYS = {
+  provider: 'agentman:modelProvider',
+  groqModel: 'agentman:groqModel'
+};
+
+function loadModelPreferences() {
+  try {
+    const storedProvider = localStorage.getItem(STORAGE_KEYS.provider);
+    if (Object.values(MODEL_PROVIDERS).includes(storedProvider)) {
+      selectedModelProvider = storedProvider;
+    }
+
+    const storedGroqModel = localStorage.getItem(STORAGE_KEYS.groqModel);
+    if (GROQ_MODEL_OPTIONS.includes(storedGroqModel)) {
+      selectedGroqModel = storedGroqModel;
+    }
+  } catch {}
+}
+
+function saveModelPreferences() {
+  try {
+    localStorage.setItem(STORAGE_KEYS.provider, selectedModelProvider);
+    localStorage.setItem(STORAGE_KEYS.groqModel, selectedGroqModel);
+  } catch {}
+}
+
 function getActive() { return requests.find(r => r.id === activeId); }
 
 function renderSidebar() {
@@ -222,7 +248,11 @@ function renderModelProvider() {
       gemini: 'Gemini',
       groq: 'Groq'
     };
-    statusText.textContent = labels[selectedModelProvider] || 'OpenRouter';
+    if (selectedModelProvider === MODEL_PROVIDERS.groq) {
+      statusText.textContent = `Groq (${selectedGroqModel})`;
+    } else {
+      statusText.textContent = labels[selectedModelProvider] || 'OpenRouter';
+    }
   }
 }
 
@@ -233,6 +263,7 @@ function setModelProvider(provider) {
     return;
   }
   selectedModelProvider = provider;
+  saveModelPreferences();
   renderModelProvider();
   const labels = {
     openrouter: 'OpenRouter',
@@ -250,6 +281,7 @@ function setGroqModel(model) {
     return;
   }
   selectedGroqModel = model;
+  saveModelPreferences();
   renderModelProvider();
   addAgentMsg('system', `Groq model switched to ${model}.`);
 }
@@ -1181,6 +1213,12 @@ function removeTypingIndicator() { document.getElementById('typing-indicator')?.
 
 function quickPrompt(text) { document.getElementById('agent-input').value = text; askAgent(); }
 
+function describeActiveModel() {
+  if (selectedModelProvider === MODEL_PROVIDERS.groq) return `Groq / ${selectedGroqModel}`;
+  if (selectedModelProvider === MODEL_PROVIDERS.gemini) return 'Gemini';
+  return 'OpenRouter';
+}
+
 function promptSecurityTarget() {
   const domain = window.prompt(
     'Enter target domain or URL for security scan.\n\nExamples:\n  example.com\n  https://api.example.com\n  http://localhost:8080\n\nLeave blank to use current endpoint.'
@@ -1375,6 +1413,7 @@ async function askAgent() {
   if (!chatGoal) chatGoal = initialUserMsg;
 
   addAgentMsg('user', initialUserMsg);
+  addAgentMsg('system', `Using model: ${describeActiveModel()}.`, [], { track: false });
   addTypingIndicator();
   agentRunState.isRunning = true;
   agentRunState.stopRequested = false;
@@ -1633,6 +1672,7 @@ const origSendRequest = sendRequest;
 })();
 
 // Init
+loadModelPreferences();
 loadActive();
 renderSidebar();
 renderModelProvider();

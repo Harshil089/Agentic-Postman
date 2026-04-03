@@ -39,6 +39,11 @@
         <span class="sidebar-window-label">Errors</span>
         <span class="sidebar-window-badge" id="errors-count-badge">0</span>
       </button>
+      <button class="sidebar-window-btn" data-window="history" onclick="setSidebarWindow('history')" title="History">
+        <span class="sidebar-window-icon">H</span>
+        <span class="sidebar-window-label">History</span>
+        <span class="sidebar-window-badge" id="history-count-badge">0</span>
+      </button>
       <button class="sidebar-window-btn" data-window="diagnostics" onclick="setSidebarWindow('diagnostics')" title="Diagnostics">
         <span class="sidebar-window-icon">D</span>
         <span class="sidebar-window-label">Diagnostics</span>
@@ -68,6 +73,7 @@
       <div class="tab active" data-tab="params">Params</div>
       <div class="tab" data-tab="headers">Headers</div>
       <div class="tab" data-tab="body">Body</div>
+      <div class="tab" data-tab="env">Env</div>
       <div class="tab" data-tab="assertions">Assertions <span class="tab-badge" id="assertion-count">0</span></div>
     </div>
 
@@ -91,6 +97,29 @@
       <!-- Body -->
       <div class="tab-content" id="tab-body">
         <textarea class="body-editor" id="body-editor" placeholder='{ "key": "value" }'></textarea>
+      </div>
+      <!-- Environment -->
+      <div class="tab-content" id="tab-env">
+        <div class="env-toolbar">
+          <label for="env-select" class="env-label">Environment</label>
+          <select class="env-select" id="env-select"></select>
+          <button class="icon-btn" id="env-new-btn" title="New environment">+</button>
+          <button class="icon-btn" id="env-delete-btn" title="Delete environment">−</button>
+        </div>
+
+        <div class="env-section-title">Variables (use in requests as {{variableName}})</div>
+        <table class="kv-table">
+          <thead><tr><th>Key</th><th>Value</th></tr></thead>
+          <tbody id="env-vars-body"></tbody>
+        </table>
+        <button class="add-row-btn" onclick="addKVRow('env-vars-body')">+ Add variable</button>
+
+        <div class="env-section-title">Default headers (applied when request header is missing)</div>
+        <table class="kv-table">
+          <thead><tr><th>Header</th><th>Value</th></tr></thead>
+          <tbody id="env-headers-body"></tbody>
+        </table>
+        <button class="add-row-btn" onclick="addKVRow('env-headers-body')">+ Add default header</button>
       </div>
       <!-- Assertions -->
       <div class="tab-content" id="tab-assertions">
@@ -233,6 +262,7 @@
 </div>
 </div>
 
+<script src="workspace-utils.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

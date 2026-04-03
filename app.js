@@ -76,9 +76,13 @@ let securityThreatLevel = 'none';
 let activeSidebarWindow = 'requests';
 let errorLogEntries = [];
 let structuredDiagnosticsEntries = [];
+let requestHistoryEntries = [];
+let environments = [];
+let activeEnvironmentId = 'default';
 let scanPaceSetting = '0';
 let adaptiveScanPacingMs = 2000;
 let agentPanelOpen = true;
+let requestHistoryIdCounter = 1;
 const AGENT_INPUT_MAX_CHARS = 2000;
 const scanProgressState = {
   active: false,
@@ -117,10 +121,300 @@ const STORAGE_KEYS = {
   groqModel: 'agentman:groqModel',
   sidebarWindow: 'agentman:sidebarWindow',
   scanPaceMs: 'agentman:scanPaceMs',
-  scanPaceSetting: 'agentman:scanPaceSetting'
+  scanPaceSetting: 'agentman:scanPaceSetting',
+  workspace: 'agentman:workspace'
 };
 
 const SCAN_PACE_VALUES = new Set(['0', '2000', '5000', '8000', 'adaptive']);
+const WORKSPACE_SCHEMA_VERSION = 1;
+const WORKSPACE_HISTORY_LIMIT = 60;
+const WORKSPACE_TEXT_PREVIEW_LIMIT = 320;
+const DEFAULT_ENVIRONMENT_ID = 'default';
+const workspaceUtils = (typeof window !== 'undefined' && window.AgentmanWorkspaceUtils)
+  ? window.AgentmanWorkspaceUtils
+  : {
+      summarizePreview: (text, limit = WORKSPACE_TEXT_PREVIEW_LIMIT) => {
+        const value = String(text || '').trim();
+        if (!value) return '';
+        return value.length > limit ? `${value.slice(0, limit).trimEnd()}...` : value;
+      },
+      describeRequestDiff: () => 'request: no changes; response: no previous run',
+      resolveChainTemplate: (url) => url,
+      resolveVariableTemplate: (text) => text
+    };
+
+function createDefaultEnvironment() {
+  return {
+    id: DEFAULT_ENVIRONMENT_ID,
+    name: 'Default',
+    variables: [{ k: 'baseUrl', v: '' }],
+    headers: []
+  };
+}
+
+function cloneSerializable(value) {
+  if (value == null) return value;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeKeyValueEntries(entries) {
+  return Array.isArray(entries)
+    ? entries
+        .map(entry => ({
+          k: typeof entry?.k === 'string' ? entry.k : '',
+          v: typeof entry?.v === 'string' ? entry.v : ''
+        }))
+        .filter(entry => entry.k || entry.v)
+    : [];
+}
+
+function sanitizeAssertionEntries(assertions) {
+  return Array.isArray(assertions)
+    ? assertions
+        .map(entry => ({
+          expr: typeof entry?.expr === 'string' ? entry.expr : '',
+          status: typeof entry?.status === 'string' ? entry.status : 'pending',
+          error: typeof entry?.error === 'string' ? entry.error : ''
+        }))
+        .filter(entry => entry.expr)
+    : [];
+}
+
+function normalizeRequestRecord(record, fallbackId) {
+  const source = record && typeof record === 'object' ? record : {};
+  const numericId = Number(source.id);
+  const id = Number.isFinite(numericId) && numericId > 0 ? numericId : fallbackId;
+  const method = typeof source.method === 'string' ? source.method.toUpperCase() : 'GET';
+  return {
+    id,
+    name: typeof source.name === 'string' && source.name.trim() ? source.name : `Request ${id}`,
+    method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(method) ? method : 'GET',
+    url: typeof source.url === 'string' ? source.url : '',
+    params: sanitizeKeyValueEntries(source.params),
+    headers: sanitizeKeyValueEntries(source.headers),
+    body: typeof source.body === 'string' ? source.body : '',
+    assertions: sanitizeAssertionEntries(source.assertions),
+    chainOf: Number.isFinite(Number(source.chainOf)) ? Number(source.chainOf) : null,
+    chainNote: typeof source.chainNote === 'string' ? source.chainNote : ''
+  };
+}
+
+function normalizeConversationEntries(entries) {
+  return Array.isArray(entries)
+    ? entries
+        .map(entry => ({
+          role: typeof entry?.role === 'string' ? entry.role : 'system',
+          text: typeof entry?.text === 'string' ? entry.text : ''
+        }))
+        .filter(entry => entry.text)
+    : [];
+}
+
+function normalizeEnvironmentRecord(env, fallbackIndex) {
+  const source = env && typeof env === 'object' ? env : {};
+  const rawId = typeof source.id === 'string' ? source.id.trim() : '';
+  const id = rawId || `env-${fallbackIndex}`;
+  const name = typeof source.name === 'string' && source.name.trim() ? source.name.trim() : `Environment ${fallbackIndex}`;
+  let variables = sanitizeKeyValueEntries(source.variables);
+  if (!variables.some(entry => entry.k === 'baseUrl')) {
+    variables = [{ k: 'baseUrl', v: '' }, ...variables];
+  }
+  return {
+    id,
+    name,
+    variables,
+    headers: sanitizeKeyValueEntries(source.headers)
+  };
+}
+
+function normalizeGenericLogEntries(entries) {
+  return Array.isArray(entries) ? entries.map(entry => cloneSerializable(entry)).filter(Boolean) : [];
+}
+
+function normalizeHistoryEntry(entry) {
+  const source = entry && typeof entry === 'object' ? entry : {};
+  const requestSnapshot = normalizeRequestRecord(source.requestSnapshot || source.request || {}, Number(source.requestId || 1));
+  const numericStatus = Number(source.status);
+  const numericElapsed = Number(source.elapsed_ms);
+  return {
+    id: typeof source.id === 'string' && source.id.trim() ? source.id : `history-${requestHistoryIdCounter++}`,
+    requestId: requestSnapshot.id,
+    requestName: typeof source.requestName === 'string' && source.requestName.trim() ? source.requestName : requestSnapshot.name,
+    method: typeof source.method === 'string' && source.method.trim() ? source.method : requestSnapshot.method,
+    url: typeof source.url === 'string' && source.url.trim() ? source.url : requestSnapshot.url,
+    status: Number.isFinite(numericStatus) ? numericStatus : 0,
+    statusText: typeof source.statusText === 'string' ? source.statusText : '',
+    elapsed_ms: Number.isFinite(numericElapsed) ? numericElapsed : 0,
+    responsePreview: typeof source.responsePreview === 'string' ? source.responsePreview : '',
+    diffSummary: typeof source.diffSummary === 'string' ? source.diffSummary : '',
+    createdAt: typeof source.createdAt === 'string' && source.createdAt.trim() ? source.createdAt : new Date().toISOString(),
+    requestSnapshot,
+    responseHeaders: source.responseHeaders && typeof source.responseHeaders === 'object' ? cloneSerializable(source.responseHeaders) || {} : {}
+  };
+}
+
+function summarizePreview(text, limit = WORKSPACE_TEXT_PREVIEW_LIMIT) {
+  return workspaceUtils.summarizePreview(text, limit);
+}
+
+function describeRequestDiff(previousRequest, currentRequest, previousResponse, currentResponse) {
+  return workspaceUtils.describeRequestDiff(previousRequest, currentRequest, previousResponse, currentResponse);
+}
+
+function buildWorkspaceState() {
+  return {
+    version: WORKSPACE_SCHEMA_VERSION,
+    requests: requests.map(request => cloneSerializable(request)).filter(Boolean),
+    activeId,
+    idCounter,
+    chatGoal,
+    conversationHistory: cloneSerializable(conversationHistory) || [],
+    securityTestHistory: cloneSerializable(securityTestHistory) || [],
+    errorLogEntries: cloneSerializable(errorLogEntries) || [],
+    structuredDiagnosticsEntries: cloneSerializable(structuredDiagnosticsEntries) || [],
+    requestHistoryEntries: cloneSerializable(requestHistoryEntries) || [],
+    requestHistoryIdCounter,
+    environments: cloneSerializable(environments) || [],
+    activeEnvironmentId,
+    ui: {
+      activeSidebarWindow,
+      agentMode,
+      selectedModelProvider,
+      selectedGroqModel,
+      scanPaceSetting,
+      adaptiveScanPacingMs,
+      agentPanelOpen
+    }
+  };
+}
+
+function saveWorkspaceState() {
+  try {
+    localStorage.setItem(STORAGE_KEYS.workspace, JSON.stringify(buildWorkspaceState()));
+  } catch {}
+}
+
+function loadWorkspaceState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.workspace);
+    if (!raw) return false;
+    const stored = parseJsonSafely(raw);
+    if (!stored || typeof stored !== 'object' || Number(stored.version) !== WORKSPACE_SCHEMA_VERSION) return false;
+
+    const restoredRequests = Array.isArray(stored.requests)
+      ? stored.requests.map((request, index) => normalizeRequestRecord(request, index + 1))
+      : [];
+    requests = restoredRequests.length ? restoredRequests : [normalizeRequestRecord({ id: 1, name: 'New Request' }, 1)];
+
+    const maxRequestId = requests.reduce((max, request) => Math.max(max, Number(request.id) || 0), 0);
+    const storedActiveId = Number(stored.activeId);
+    activeId = requests.some(request => request.id === storedActiveId) ? storedActiveId : requests[0].id;
+    idCounter = Math.max(maxRequestId + 1, Number(stored.idCounter) || 0, 1);
+
+    chatGoal = typeof stored.chatGoal === 'string' ? stored.chatGoal : chatGoal;
+    conversationHistory = normalizeConversationEntries(stored.conversationHistory).slice(-40);
+    securityTestHistory = normalizeGenericLogEntries(stored.securityTestHistory).slice(-80);
+    errorLogEntries = normalizeGenericLogEntries(stored.errorLogEntries).slice(-200);
+    structuredDiagnosticsEntries = normalizeGenericLogEntries(stored.structuredDiagnosticsEntries).slice(-200);
+    requestHistoryEntries = Array.isArray(stored.requestHistoryEntries)
+      ? stored.requestHistoryEntries.map(entry => normalizeHistoryEntry(entry)).slice(-WORKSPACE_HISTORY_LIMIT)
+      : [];
+    requestHistoryIdCounter = Math.max(Number(stored.requestHistoryIdCounter) || 1, requestHistoryEntries.length + 1);
+    environments = Array.isArray(stored.environments)
+      ? stored.environments.map((env, index) => normalizeEnvironmentRecord(env, index + 1))
+      : [createDefaultEnvironment()];
+    if (!environments.length) environments = [createDefaultEnvironment()];
+    const storedEnvironmentId = typeof stored.activeEnvironmentId === 'string' ? stored.activeEnvironmentId : DEFAULT_ENVIRONMENT_ID;
+    activeEnvironmentId = environments.some(env => env.id === storedEnvironmentId)
+      ? storedEnvironmentId
+      : environments[0].id;
+
+    const ui = stored.ui && typeof stored.ui === 'object' ? stored.ui : {};
+    if (typeof ui.activeSidebarWindow === 'string' && ['requests', 'history', 'errors', 'diagnostics'].includes(ui.activeSidebarWindow)) {
+      activeSidebarWindow = ui.activeSidebarWindow;
+    }
+    if (typeof ui.agentMode === 'string' && AGENT_MODE_META[ui.agentMode]) {
+      agentMode = ui.agentMode;
+    }
+    if (Object.values(MODEL_PROVIDERS).includes(ui.selectedModelProvider)) {
+      selectedModelProvider = ui.selectedModelProvider;
+    }
+    if (typeof ui.selectedGroqModel === 'string' && GROQ_MODEL_OPTIONS.includes(ui.selectedGroqModel)) {
+      selectedGroqModel = ui.selectedGroqModel;
+    }
+    if (SCAN_PACE_VALUES.has(ui.scanPaceSetting)) {
+      scanPaceSetting = ui.scanPaceSetting;
+    }
+    if (Number.isFinite(Number(ui.adaptiveScanPacingMs))) {
+      adaptiveScanPacingMs = Number(ui.adaptiveScanPacingMs);
+    }
+    if (typeof ui.agentPanelOpen === 'boolean') {
+      agentPanelOpen = ui.agentPanelOpen;
+    }
+    renderEnvironmentEditor();
+    return true;
+  } catch {
+    environments = [createDefaultEnvironment()];
+    activeEnvironmentId = DEFAULT_ENVIRONMENT_ID;
+    return false;
+  }
+}
+
+function recordRequestHistoryEntry(request, response) {
+  if (!request || !response || typeof response.status !== 'number') return null;
+  const requestSnapshot = normalizeRequestRecord(cloneSerializable(request) || request, request.id || idCounter);
+  const previousEntry = [...requestHistoryEntries].reverse().find(entry => entry.requestId === requestSnapshot.id);
+  const responsePreview = summarizePreview(response.text, WORKSPACE_TEXT_PREVIEW_LIMIT);
+  const nextEntry = {
+    id: `history-${requestHistoryIdCounter++}`,
+    requestId: requestSnapshot.id,
+    requestName: requestSnapshot.name,
+    method: requestSnapshot.method,
+    url: requestSnapshot.url,
+    status: response.status,
+    statusText: typeof response.statusText === 'string' ? response.statusText : '',
+    elapsed_ms: Number(response.elapsed || response.elapsed_ms || 0),
+    responsePreview,
+    diffSummary: describeRequestDiff(previousEntry?.requestSnapshot, requestSnapshot, previousEntry, {
+      status: response.status,
+      elapsed_ms: Number(response.elapsed || response.elapsed_ms || 0),
+      responsePreview
+    }),
+    createdAt: new Date().toISOString(),
+    requestSnapshot,
+    responseHeaders: response.headers && typeof response.headers === 'object' ? cloneSerializable(response.headers) || {} : {}
+  };
+  requestHistoryEntries.push(nextEntry);
+  if (requestHistoryEntries.length > WORKSPACE_HISTORY_LIMIT) {
+    requestHistoryEntries = requestHistoryEntries.slice(-WORKSPACE_HISTORY_LIMIT);
+  }
+  saveWorkspaceState();
+  renderSidebarWindowNav();
+  if (activeSidebarWindow === 'history') renderSidebar();
+  return nextEntry;
+}
+
+function replayHistoryEntry(entryId) {
+  const entry = requestHistoryEntries.find(item => item.id === entryId);
+  if (!entry) return;
+  saveActive();
+  const activeRequest = getActive();
+  if (!activeRequest) return;
+  const restored = normalizeRequestRecord(entry.requestSnapshot, activeRequest.id);
+  restored.id = activeRequest.id;
+  const index = requests.findIndex(request => request.id === activeRequest.id);
+  if (index >= 0) {
+    requests[index] = restored;
+  }
+  loadActive();
+  renderSidebar();
+  saveWorkspaceState();
+  addAgentMsg('system', `Replayed history entry for ${restored.method} ${restored.url || '(empty URL)'}.`, [], { track: false });
+}
 
 function normalizeGeminiModel(model) {
   const value = typeof model === 'string' ? model.trim().replace(/^models\//, '') : '';
@@ -150,7 +444,7 @@ function loadModelPreferences() {
     }
 
     const storedSidebarWindow = localStorage.getItem(STORAGE_KEYS.sidebarWindow);
-    if (storedSidebarWindow === 'requests' || storedSidebarWindow === 'errors' || storedSidebarWindow === 'diagnostics') {
+    if (storedSidebarWindow === 'requests' || storedSidebarWindow === 'history' || storedSidebarWindow === 'errors' || storedSidebarWindow === 'diagnostics') {
       activeSidebarWindow = storedSidebarWindow;
     }
 
@@ -252,11 +546,134 @@ function setScanPace(msRaw) {
 
 function getActive() { return requests.find(r => r.id === activeId); }
 
+function getActiveEnvironment() {
+  const selected = environments.find(env => env.id === activeEnvironmentId);
+  if (selected) return selected;
+  if (!environments.length) {
+    environments = [createDefaultEnvironment()];
+  }
+  activeEnvironmentId = environments[0].id;
+  return environments[0];
+}
+
+function getEnvironmentVariableMap(environment) {
+  const env = environment || getActiveEnvironment();
+  const map = {};
+  (env?.variables || []).forEach(entry => {
+    if (!entry || typeof entry.k !== 'string') return;
+    const key = entry.k.trim();
+    if (!key) return;
+    map[key] = typeof entry.v === 'string' ? entry.v : '';
+  });
+  return map;
+}
+
+function resolveEnvironmentTemplate(text, variableMap) {
+  return workspaceUtils.resolveVariableTemplate(text, variableMap, true);
+}
+
+function mergeEnvironmentHeaders(targetHeaders, environment) {
+  const merged = targetHeaders && typeof targetHeaders === 'object' ? targetHeaders : {};
+  const existingLower = new Set(Object.keys(merged).map(key => key.toLowerCase()));
+  (environment?.headers || []).forEach(entry => {
+    const key = String(entry?.k || '').trim();
+    if (!key || existingLower.has(key.toLowerCase())) return;
+    merged[key] = String(entry?.v || '');
+  });
+  return merged;
+}
+
+function joinBaseUrl(baseUrl, pathPart) {
+  const base = String(baseUrl || '').trim();
+  const path = String(pathPart || '').trim();
+  if (!base || !path || /^https?:\/\//i.test(path)) return path;
+  const left = base.endsWith('/') ? base.slice(0, -1) : base;
+  const right = path.startsWith('/') ? path : `/${path}`;
+  return `${left}${right}`;
+}
+
+function saveEnvironmentFromEditor() {
+  const env = getActiveEnvironment();
+  if (!env) return;
+  env.variables = readKVTable('env-vars-body');
+  if (!env.variables.some(entry => entry.k === 'baseUrl')) {
+    env.variables = [{ k: 'baseUrl', v: '' }, ...env.variables];
+  }
+  env.headers = readKVTable('env-headers-body');
+  saveWorkspaceState();
+}
+
+function renderEnvironmentEditor() {
+  const select = document.getElementById('env-select');
+  const varsBody = document.getElementById('env-vars-body');
+  const headersBody = document.getElementById('env-headers-body');
+  if (!select || !varsBody || !headersBody) return;
+
+  if (!environments.length) {
+    environments = [createDefaultEnvironment()];
+  }
+  if (!environments.some(env => env.id === activeEnvironmentId)) {
+    activeEnvironmentId = environments[0].id;
+  }
+
+  select.innerHTML = environments
+    .map(env => `<option value="${escHtml(env.id)}">${escHtml(env.name)}</option>`)
+    .join('');
+  select.value = activeEnvironmentId;
+
+  const env = getActiveEnvironment();
+  populateKVTable('env-vars-body', env.variables);
+  populateKVTable('env-headers-body', env.headers);
+}
+
+function setActiveEnvironment(environmentId) {
+  const id = String(environmentId || '').trim();
+  if (!id || !environments.some(env => env.id === id)) return;
+  saveEnvironmentFromEditor();
+  activeEnvironmentId = id;
+  renderEnvironmentEditor();
+  saveWorkspaceState();
+}
+
+function createEnvironment() {
+  const label = prompt('Environment name:', `Environment ${environments.length + 1}`);
+  if (!label) return;
+  saveEnvironmentFromEditor();
+  const id = `env-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  environments.push({
+    id,
+    name: label.trim() || `Environment ${environments.length + 1}`,
+    variables: [{ k: 'baseUrl', v: '' }],
+    headers: []
+  });
+  activeEnvironmentId = id;
+  renderEnvironmentEditor();
+  saveWorkspaceState();
+}
+
+function deleteActiveEnvironment() {
+  if (environments.length <= 1) {
+    addAgentMsg('system', 'At least one environment is required.', [], { track: false });
+    return;
+  }
+  const env = getActiveEnvironment();
+  const proceed = confirm(`Delete environment "${env.name}"?`);
+  if (!proceed) return;
+  environments = environments.filter(item => item.id !== env.id);
+  activeEnvironmentId = environments[0].id;
+  renderEnvironmentEditor();
+  saveWorkspaceState();
+}
+
 function renderSidebar() {
   renderSidebarWindowNav();
   renderSidebarHeader();
   if (activeSidebarWindow === 'errors') {
     renderErrorSidebar();
+    return;
+  }
+  if (activeSidebarWindow === 'history') {
+    renderRequestHistorySidebar();
     return;
   }
   if (activeSidebarWindow === 'diagnostics') {
@@ -285,6 +702,8 @@ function renderSidebarWindowNav() {
   if (badge) badge.textContent = String(errorLogEntries.length);
   const diagBadge = document.getElementById('diagnostics-count-badge');
   if (diagBadge) diagBadge.textContent = String(structuredDiagnosticsEntries.length);
+  const historyBadge = document.getElementById('history-count-badge');
+  if (historyBadge) historyBadge.textContent = String(requestHistoryEntries.length);
 }
 
 function renderSidebarHeader() {
@@ -294,6 +713,8 @@ function renderSidebarHeader() {
   if (title) {
     title.textContent = activeSidebarWindow === 'errors'
       ? 'Errors'
+      : activeSidebarWindow === 'history'
+        ? 'History'
       : activeSidebarWindow === 'diagnostics'
         ? 'Diagnostics'
         : 'Requests';
@@ -341,6 +762,41 @@ function renderDiagnosticsSidebar() {
     .join('');
 }
 
+function renderRequestHistorySidebar() {
+  const list = document.getElementById('sidebar-list');
+  if (!list) return;
+  if (!requestHistoryEntries.length) {
+    list.innerHTML = `<div class="error-empty">No request history yet.</div>`;
+    return;
+  }
+
+  list.innerHTML = requestHistoryEntries
+    .slice()
+    .reverse()
+    .map(entry => {
+      const statusClass = entry.status >= 500 ? 's-5xx' : entry.status >= 400 ? 's-4xx' : 's-2xx';
+      return `
+        <div class="history-item">
+          <div class="history-item-header">
+            <span class="history-item-source">${escHtml(entry.requestName || entry.method || 'Request')}</span>
+            <span class="history-item-time">${escHtml(entry.createdAt || '')}</span>
+          </div>
+          <div class="history-item-meta">
+            <span class="history-chip m-${escHtml(entry.method || 'GET')}">${escHtml(entry.method || 'GET')}</span>
+            <span class="history-chip ${statusClass}">${escHtml(String(entry.status || ''))}</span>
+            <span class="history-chip">${escHtml(String(entry.elapsed_ms || 0))}ms</span>
+          </div>
+          <div class="history-item-body">${escHtml(entry.responsePreview || 'No response preview.')}</div>
+          <div class="history-item-diff">${escHtml(entry.diffSummary || 'No diff summary available.')}</div>
+          <div class="history-item-actions">
+            <button class="history-replay-btn" type="button" onclick="replayHistoryEntry('${escHtml(entry.id)}')">Replay</button>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+}
+
 function renderErrorSidebar() {
   const list = document.getElementById('sidebar-list');
   if (!list) return;
@@ -365,16 +821,18 @@ function renderErrorSidebar() {
 }
 
 function setSidebarWindow(windowName) {
-  if (windowName !== 'requests' && windowName !== 'errors' && windowName !== 'diagnostics') return;
+  if (windowName !== 'requests' && windowName !== 'history' && windowName !== 'errors' && windowName !== 'diagnostics') return;
   activeSidebarWindow = windowName;
   try {
     localStorage.setItem(STORAGE_KEYS.sidebarWindow, windowName);
   } catch {}
+  saveWorkspaceState();
   renderSidebar();
 }
 
 function clearErrorLogs() {
   errorLogEntries = [];
+  saveWorkspaceState();
   renderSidebar();
   addAgentMsg('system', 'Cleared error log entries.', [], { track: false });
 }
@@ -396,6 +854,7 @@ function logStructuredDiagnostics(sourcePath, diagnostics) {
   if (structuredDiagnosticsEntries.length > 200) {
     structuredDiagnosticsEntries = structuredDiagnosticsEntries.slice(-200);
   }
+  saveWorkspaceState();
   renderSidebarWindowNav();
   if (activeSidebarWindow === 'diagnostics') {
     renderDiagnosticsSidebar();
@@ -413,6 +872,7 @@ function logError(source, message) {
   if (errorLogEntries.length > 200) {
     errorLogEntries = errorLogEntries.slice(-200);
   }
+  saveWorkspaceState();
   renderSidebarWindowNav();
   if (activeSidebarWindow === 'errors') {
     renderErrorSidebar();
@@ -423,6 +883,7 @@ function selectRequest(id) {
   saveActive();
   activeId = id;
   loadActive();
+  saveWorkspaceState();
   renderSidebar();
 }
 
@@ -434,6 +895,7 @@ function saveActive() {
   r.body = document.getElementById('body-editor').value;
   r.params = readKVTable('params-body');
   r.headers = readKVTable('headers-body');
+  saveWorkspaceState();
 }
 
 function loadActive() {
@@ -449,6 +911,7 @@ function loadActive() {
   document.getElementById('response-body').innerHTML = `<div class="empty-state"><div class="empty-icon">◎</div><div>Send a request or ask the agent to generate one</div></div>`;
   document.getElementById('status-tag').textContent = '';
   document.getElementById('time-tag').textContent = '';
+  renderEnvironmentEditor();
 }
 
 function readKVTable(tbodyId) {
@@ -476,6 +939,9 @@ function addKVRow(tbodyId, k = '', v = '') {
     <td><input class="kv-input" placeholder="value" value="${escHtml(v)}" /></td>
   `;
   tbody.appendChild(tr);
+  if (tbodyId === 'env-vars-body' || tbodyId === 'env-headers-body') {
+    saveEnvironmentFromEditor();
+  }
 }
 
 function escHtml(s) { return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -555,6 +1021,7 @@ function recordConversationTurn(role, text) {
   if (conversationHistory.length > 40) {
     conversationHistory = conversationHistory.slice(-40);
   }
+  saveWorkspaceState();
 }
 
 function renderAgentMode() {
@@ -621,6 +1088,7 @@ function setModelProvider(provider) {
   }
   selectedModelProvider = provider;
   saveModelPreferences();
+  saveWorkspaceState();
   renderModelProvider();
   const labels = {
     openrouter: 'OpenRouter',
@@ -639,6 +1107,7 @@ function setGroqModel(model) {
   }
   selectedGroqModel = model;
   saveModelPreferences();
+  saveWorkspaceState();
   renderModelProvider();
   addAgentMsg('system', `Groq model switched to ${model}.`);
 }
@@ -650,6 +1119,7 @@ function setAgentMode(mode) {
     return;
   }
   agentMode = mode;
+  saveWorkspaceState();
   renderAgentMode();
   addAgentMsg('system', `Mode switched to ${AGENT_MODE_META[mode].label}.`);
 }
@@ -810,6 +1280,7 @@ document.getElementById('send-btn').addEventListener('click', sendRequest);
 
 async function sendRequest(options = {}) {
   let { confirmMutation = false, skipAutoAssertions = false } = options;
+  saveEnvironmentFromEditor();
   saveActive();
   const r = getActive();
   const btn = document.getElementById('send-btn');
@@ -829,17 +1300,42 @@ async function sendRequest(options = {}) {
     confirmMutation = true;
   }
 
-  let url = r.url.trim();
-  const params = r.params.filter(p => p.k);
+  const activeEnvironment = getActiveEnvironment();
+  const envVarMap = getEnvironmentVariableMap(activeEnvironment);
+
+  let url = resolveEnvironmentTemplate(r.url.trim(), envVarMap);
+  if (/^\//.test(url) && !/^\/\//.test(url) && envVarMap.baseUrl) {
+    url = joinBaseUrl(envVarMap.baseUrl, url);
+  }
+
+  const params = r.params
+    .map(p => ({
+      k: resolveEnvironmentTemplate(String(p?.k || ''), envVarMap),
+      v: resolveEnvironmentTemplate(String(p?.v || ''), envVarMap)
+    }))
+    .filter(p => p.k);
   if (params.length) {
     const qs = params.map(p => `${encodeURIComponent(p.k)}=${encodeURIComponent(p.v)}`).join('&');
     url += (url.includes('?') ? '&' : '?') + qs;
   }
+  url = resolveChainTemplate(url);
 
   const fetchOpts = { method: r.method, headers: {} };
-  (r.headers || []).filter(h => h.k).forEach(h => { fetchOpts.headers[h.k] = h.v; });
+  (r.headers || [])
+    .map(h => ({
+      k: resolveEnvironmentTemplate(String(h?.k || ''), envVarMap),
+      v: resolveEnvironmentTemplate(String(h?.v || ''), envVarMap)
+    }))
+    .filter(h => h.k)
+    .forEach(h => { fetchOpts.headers[h.k] = h.v; });
+  mergeEnvironmentHeaders(fetchOpts.headers, {
+    headers: (activeEnvironment?.headers || []).map(h => ({
+      k: resolveEnvironmentTemplate(String(h?.k || ''), envVarMap),
+      v: resolveEnvironmentTemplate(String(h?.v || ''), envVarMap)
+    }))
+  });
   if (r.body && ['POST','PUT','PATCH'].includes(r.method)) {
-    fetchOpts.body = r.body;
+    fetchOpts.body = resolveEnvironmentTemplate(r.body, envVarMap);
     if (!fetchOpts.headers['Content-Type']) fetchOpts.headers['Content-Type'] = 'application/json';
   }
 
@@ -865,6 +1361,7 @@ async function sendRequest(options = {}) {
     document.getElementById('response-body').textContent = formatted;
 
     runAssertions(r.assertions, lastResponse);
+    recordRequestHistoryEntry(r, lastResponse);
     if (r.assertions.length === 0 && !skipAutoAssertions) autoSuggestAssertions();
     return lastResponse;
   } catch (e) {
@@ -1146,6 +1643,7 @@ function appendSecurityHistory(entry) {
   if (securityTestHistory.length > 80) {
     securityTestHistory = securityTestHistory.slice(-80);
   }
+  saveWorkspaceState();
 }
 
 function applyProbeAction(action, options = {}) {
@@ -1989,16 +2487,17 @@ function runAssertions(assertions, resp) {
   });
   renderAssertions(assertions);
   switchTab('assertions');
+  saveWorkspaceState();
 }
 
 function removeAssertion(i) {
-  const r = getActive(); r.assertions.splice(i, 1); renderAssertions(r.assertions);
+  const r = getActive(); r.assertions.splice(i, 1); renderAssertions(r.assertions); saveWorkspaceState();
 }
 
 function addManualAssertion() {
   const expr = prompt('Assertion expression (JS):\nVariables: status, json, body\n\nExample: status === 200');
   if (!expr) return;
-  const r = getActive(); r.assertions.push({ expr, status: 'pending' }); renderAssertions(r.assertions);
+  const r = getActive(); r.assertions.push({ expr, status: 'pending' }); renderAssertions(r.assertions); saveWorkspaceState();
 }
 
 function switchTab(name) {
@@ -2030,6 +2529,7 @@ async function autoSuggestAssertions() {
     r.assertions = arr.map(expr => ({ expr, status: 'pending' }));
     renderAssertions(r.assertions);
     switchTab('assertions');
+    saveWorkspaceState();
     addAgentMsg('system', `Generated ${arr.length} assertions. Check the Assertions tab to review and run them.`);
   } catch (error) {
     logError('assertions', `Automatic assertion generation failed: ${error.message}`);
@@ -2649,7 +3149,7 @@ function applySetRequest(action, options = {}) {
   r.body = action.body || '';
   r.params = action.params || [];
   r.name = action.name || r.name;
-  loadActive(); renderSidebar();
+  loadActive(); renderSidebar(); saveWorkspaceState();
   if (!skipMessage) addAgentMsg('system', `Applied: ${action.method} ${action.url}`);
 }
 
@@ -2659,6 +3159,7 @@ function applyAssertions(list, options = {}) {
   r.assertions = (list || []).map(expr => ({ expr, status: 'pending' }));
   renderAssertions(r.assertions);
   switchTab('assertions');
+  saveWorkspaceState();
   if (!skipMessage) addAgentMsg('system', `Added ${list.length} assertions. Send the request to run them.`);
 }
 
@@ -2673,6 +3174,7 @@ function applyChainRequest(action) {
   };
   requests.push(newReq);
   renderSidebar();
+  saveWorkspaceState();
   addAgentMsg('system', `Chained request added: "${newReq.name}". ${action.chainNote || ''} Select it in the sidebar and hit Send.`);
 }
 
@@ -2887,10 +3389,47 @@ document.getElementById('new-req-btn').addEventListener('click', () => {
   const newReq = { id: idCounter++, name: 'New Request', method: 'GET', url: '', params: [], headers: [], body: '', assertions: [], chainOf: null };
   requests.push(newReq);
   activeId = newReq.id;
-  loadActive(); renderSidebar();
+  loadActive(); renderSidebar(); saveWorkspaceState();
 });
 
 document.getElementById('clear-errors-btn').addEventListener('click', clearErrorLogs);
+
+['url-input', 'body-editor', 'method-select', 'params-body', 'headers-body'].forEach(id => {
+  const element = document.getElementById(id);
+  if (!element) return;
+  element.addEventListener(id === 'method-select' ? 'change' : 'input', () => saveActive());
+});
+
+const envSelectEl = document.getElementById('env-select');
+if (envSelectEl) {
+  envSelectEl.addEventListener('change', event => {
+    setActiveEnvironment(event.target.value);
+  });
+}
+
+const envNewBtnEl = document.getElementById('env-new-btn');
+if (envNewBtnEl) {
+  envNewBtnEl.addEventListener('click', createEnvironment);
+}
+
+const envDeleteBtnEl = document.getElementById('env-delete-btn');
+if (envDeleteBtnEl) {
+  envDeleteBtnEl.addEventListener('click', deleteActiveEnvironment);
+}
+
+['env-vars-body', 'env-headers-body'].forEach(id => {
+  const tbody = document.getElementById(id);
+  if (!tbody) return;
+  tbody.addEventListener('input', () => saveEnvironmentFromEditor());
+});
+
+window.addEventListener('beforeunload', () => {
+  try {
+    saveEnvironmentFromEditor();
+    saveActive();
+    saveWorkspaceState();
+  } catch {}
+});
 
 // Copy response
 document.getElementById('copy-res-btn').addEventListener('click', () => {
@@ -2898,47 +3437,15 @@ document.getElementById('copy-res-btn').addEventListener('click', () => {
 });
 
 // Chain URL resolver — expand {{json.field}} at send time
-const origSend = window.fetch;
-// We patch the send to resolve chain templates before actual fetch
 function resolveChainTemplate(url) {
-  if (!url.includes('{{')) return url;
-  if (!lastResponse?.text) return url;
-  let parsed; try { parsed = JSON.parse(lastResponse.text); } catch { return url; }
-
-  const readPath = (obj, path) => {
-    const tokens = [];
-    const regex = /([^[.\]]+)|\[(\d+)\]/g;
-    let m;
-    while ((m = regex.exec(path)) !== null) {
-      tokens.push(m[1] !== undefined ? m[1] : Number(m[2]));
-    }
-    return tokens.reduce((acc, token) => (acc == null ? undefined : acc[token]), obj);
-  };
-
-  return url.replace(/\{\{json\.([^}]+)\}\}/g, (_, path) => {
-    const val = readPath(parsed, path);
-    return val !== undefined ? val : _;
-  });
+  return workspaceUtils.resolveChainTemplate(url, lastResponse?.text || '');
 }
-const origSendBtn = document.getElementById('send-btn');
-origSendBtn.addEventListener('click', () => {}, true);
-// Override URL resolution in sendRequest
-const origSendRequest = sendRequest;
-
-// Patch sendRequest to resolve templates
-(function() {
-  const origFn = window.sendRequest;
-  window.sendRequest = function() {
-    const r = getActive();
-    if (r && r.chainOf && lastResponse) r.url = resolveChainTemplate(r.url);
-    return origSendRequest.apply(this, arguments);
-  };
-})();
 
 // Init
 (async function initApp() {
   initFluidBackground();
   loadModelPreferences();
+  loadWorkspaceState();
   await loadRuntimeConfig();
   loadActive();
   renderWelcomeMessage();

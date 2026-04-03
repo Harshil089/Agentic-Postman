@@ -75,6 +75,9 @@ const GROQ_MODEL_ORDER = [
   'groq/qwen3-32b'
 ];
 const GEMINI_REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 12000);
+const OUTBOUND_REQUEST_TIMEOUT_MS = Number(process.env.OUTBOUND_REQUEST_TIMEOUT_MS || 15000);
+const OUTBOUND_RESPONSE_MAX_BYTES = Number(process.env.OUTBOUND_RESPONSE_MAX_BYTES || 2 * 1024 * 1024);
+const DNS_LOOKUP_TIMEOUT_MS = Number(process.env.DNS_LOOKUP_TIMEOUT_MS || 5000);
 
 const TASK_TYPES = {
   agent: 'agent',
@@ -224,16 +227,65 @@ async function assertUrlAllowed(parsedUrl) {
   }
 
   let lookupResults;
+  let lookupTimer = null;
   try {
-    lookupResults = await dns.lookup(hostname, { all: true });
-  } catch {
-    return;
+    const lookupPromise = dns.lookup(hostname, { all: true });
+    const timeoutPromise = new Promise((_, reject) => {
+      lookupTimer = setTimeout(() => {
+        const err = new Error(`DNS lookup timed out after ${DNS_LOOKUP_TIMEOUT_MS}ms.`);
+        err.status = 502;
+        reject(err);
+      }, DNS_LOOKUP_TIMEOUT_MS);
+    });
+    lookupResults = await Promise.race([lookupPromise, timeoutPromise]);
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error('Failed to resolve target host.');
+    if (!err.status) err.status = 502;
+    if (!err.message || err.message === 'Error') {
+      err.message = 'Failed to resolve target host.';
+    }
+    throw err;
+  } finally {
+    if (lookupTimer) clearTimeout(lookupTimer);
   }
 
   if (lookupResults.some(result => isIpBlocked(result.address))) {
     const err = new Error('Resolved target address is blocked by outbound request policy.');
     err.status = 403;
     throw err;
+  }
+}
+
+async function readResponseTextWithLimit(response, maxBytes) {
+  if (!response.body) return '';
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let text = '';
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      totalBytes += chunk.byteLength;
+      if (totalBytes > maxBytes) {
+        const err = new Error(`Upstream response exceeded the ${Math.round(maxBytes / (1024 * 1024))}MB limit.`);
+        err.status = 413;
+        throw err;
+      }
+
+      text += decoder.decode(chunk, { stream: true });
+    }
+
+    text += decoder.decode();
+    return text;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
   }
 }
 
@@ -2253,8 +2305,17 @@ app.post('/api/request', async (req, res) => {
     }
 
     const startedAt = Date.now();
-    const upstream = await fetch(parsedUrl.toString(), outbound);
-    const text = await upstream.text();
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => timeoutController.abort(), OUTBOUND_REQUEST_TIMEOUT_MS);
+
+    let upstream;
+    try {
+      upstream = await fetch(parsedUrl.toString(), { ...outbound, signal: timeoutController.signal });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    const text = await readResponseTextWithLimit(upstream, OUTBOUND_RESPONSE_MAX_BYTES);
     const elapsed_ms = Date.now() - startedAt;
     const responseHeaders = Object.fromEntries(upstream.headers.entries());
 
@@ -2266,7 +2327,11 @@ app.post('/api/request', async (req, res) => {
       body: text
     });
   } catch (error) {
-    return res.status(502).json({ error: error.message || 'Upstream request failed.' });
+    const status = Number(error?.status || (error?.name === 'AbortError' ? 504 : 502));
+    const message = error?.name === 'AbortError'
+      ? `Upstream request timed out after ${OUTBOUND_REQUEST_TIMEOUT_MS}ms.`
+      : error?.message || 'Upstream request failed.';
+    return res.status(status).json({ error: message });
   }
 });
 

@@ -4,9 +4,9 @@ let OPENROUTER_MODELS = {
   security: 'openai/gpt-4o'
 };
 let GEMINI_MODELS = {
-  default: 'gemini-flash-latest',
-  advanced: 'gemini-flash-latest',
-  security: 'gemini-flash-latest'
+  default: 'gemini-2.5-flash',
+  advanced: 'gemini-2.5-flash',
+  security: 'gemini-2.5-flash'
 };
 let GROQ_MODELS = {
   default: 'groq/gpt-oss-120b',
@@ -21,6 +21,14 @@ let GROQ_MODEL_OPTIONS = [
   'groq/gpt-oss-safeguard-20b',
   'groq/qwen3-32b'
 ];
+const GEMINI_MODEL_ALIASES = {
+  'gemini-flash-latest': 'gemini-2.5-flash',
+  'gemini-2.0-flash': 'gemini-2.5-flash',
+  'gemini-2.0-flash-lite': 'gemini-2.5-flash',
+  'gemini-1.5-flash': 'gemini-2.5-flash',
+  'gemini-1.5-flash-8b': 'gemini-2.5-flash',
+  'gemini-1.5-pro': 'gemini-2.5-flash'
+};
 const MODEL_PROVIDERS = {
   openrouter: 'openrouter',
   gemini: 'gemini',
@@ -348,6 +356,8 @@ let errorLogEntries = [];
 let structuredDiagnosticsEntries = [];
 let scanPaceSetting = '0';
 let adaptiveScanPacingMs = 2000;
+let agentPanelOpen = true;
+const AGENT_INPUT_MAX_CHARS = 2000;
 const scanProgressState = {
   active: false,
   status: 'idle',
@@ -389,6 +399,21 @@ const STORAGE_KEYS = {
 };
 
 const SCAN_PACE_VALUES = new Set(['0', '2000', '5000', '8000', 'adaptive']);
+
+function normalizeGeminiModel(model) {
+  const value = typeof model === 'string' ? model.trim().replace(/^models\//, '') : '';
+  if (!value) return 'gemini-2.5-flash';
+  return GEMINI_MODEL_ALIASES[value] || value;
+}
+
+function normalizeGeminiModelsConfig(models) {
+  const source = models && typeof models === 'object' ? models : {};
+  return {
+    default: normalizeGeminiModel(source.default),
+    advanced: normalizeGeminiModel(source.advanced),
+    security: normalizeGeminiModel(source.security)
+  };
+}
 
 function loadModelPreferences() {
   try {
@@ -437,7 +462,7 @@ async function loadRuntimeConfig() {
       OPENROUTER_MODELS = { ...OPENROUTER_MODELS, ...data.models.openrouter };
     }
     if (data?.models?.gemini && typeof data.models.gemini === 'object') {
-      GEMINI_MODELS = { ...GEMINI_MODELS, ...data.models.gemini };
+      GEMINI_MODELS = normalizeGeminiModelsConfig({ ...GEMINI_MODELS, ...data.models.gemini });
     }
     if (data?.models?.groq && typeof data.models.groq === 'object') {
       GROQ_MODELS = { ...GROQ_MODELS, ...data.models.groq };
@@ -774,6 +799,26 @@ function setBubbleContent(element, text) {
   element.replaceChildren(sanitizeRichText(text));
 }
 
+function renderAgentPanelState() {
+  const panel = document.querySelector('.agent-panel');
+  if (!panel) return;
+  panel.classList.add('open');
+}
+
+function toggleAgentPanel(forceOpen) {
+  agentPanelOpen = true;
+  renderAgentPanelState();
+}
+
+function renderAgentCharCount() {
+  const inputEl = document.getElementById('agent-input');
+  const countEl = document.getElementById('agent-char-count');
+  const maxEl = document.getElementById('agent-char-max');
+  if (!inputEl || !countEl || !maxEl) return;
+  countEl.textContent = String(inputEl.value.length);
+  maxEl.textContent = String(AGENT_INPUT_MAX_CHARS);
+}
+
 function normalizeConversationText(text) {
   return String(text || '')
     .replace(/<[^>]*>/g, ' ')
@@ -801,15 +846,17 @@ function renderAgentMode() {
   });
 
   const meta = AGENT_MODE_META[agentMode] || AGENT_MODE_META.agent;
-  sendBtn.textContent = agentRunState.isRunning ? 'Running…' : meta.button;
+  sendBtn.textContent = agentRunState.isRunning ? 'Running…' : meta.button.replace(' ↗', '');
   inputEl.placeholder = meta.placeholder;
   syncAgentRunControls();
+  renderAgentCharCount();
 }
 
 function renderModelProvider() {
   const selectEl = document.getElementById('model-provider-select');
   const groqSelectEl = document.getElementById('groq-model-select');
   const groqRowEl = document.getElementById('groq-model-row');
+  const modelBadgeEl = document.getElementById('agent-model-badge');
   if (!selectEl) return;
   selectEl.value = selectedModelProvider;
   if (groqSelectEl) {
@@ -833,6 +880,13 @@ function renderModelProvider() {
       statusText.textContent = `Groq (${selectedGroqModel})`;
     } else {
       statusText.textContent = labels[selectedModelProvider] || 'OpenRouter';
+    }
+  }
+  if (modelBadgeEl) {
+    if (selectedModelProvider === MODEL_PROVIDERS.groq) {
+      modelBadgeEl.textContent = `Groq · ${selectedGroqModel}`;
+    } else {
+      modelBadgeEl.textContent = selectedModelProvider === MODEL_PROVIDERS.gemini ? 'Gemini' : 'OpenRouter';
     }
   }
 }
@@ -902,11 +956,9 @@ function renderWelcomeMessage() {
   if (!el) return;
   el.innerHTML = '';
   addAgentMsg('agent', `
-      Hi! I can help you build API requests from plain English. Try something like:<br><br>
+      I can build API requests from plain English, chain follow-up calls, debug failures, and generate assertions.<br><br>
       <em>"GET all users from JSONPlaceholder"</em><br>
-      <em>"POST a new todo with a random title"</em><br>
-      <em>"Chain: get user 1, then fetch their posts"</em><br><br>
-      I can also auto-debug errors and generate test assertions.
+      <em>"Chain: get user 1, then fetch their posts"</em>
     `, [], { track: false });
 }
 
@@ -916,6 +968,7 @@ function loadComponentIntegrationPrompt(options = {}) {
   if (!inputEl) return;
   if (!overwrite && inputEl.value.trim()) return;
   inputEl.value = COMPONENT_INTEGRATION_PROMPT;
+  renderAgentCharCount();
 }
 
 function startNewChat() {
@@ -2213,6 +2266,7 @@ document.getElementById('agent-send-btn').addEventListener('click', askAgent);
 document.getElementById('agent-input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askAgent(); }
 });
+document.getElementById('agent-input').addEventListener('input', renderAgentCharCount);
 
 function addAgentMsg(role, text, chips = [], options = {}) {
   const { track = true } = options;
@@ -2259,12 +2313,55 @@ function addTypingIndicator() {
 }
 function removeTypingIndicator() { document.getElementById('typing-indicator')?.remove(); }
 
-function quickPrompt(text) { document.getElementById('agent-input').value = text; askAgent(); }
+function quickPrompt(text) {
+  document.getElementById('agent-input').value = text;
+  renderAgentCharCount();
+  askAgent();
+}
+
+function runSelectedAgentAction() {
+  const selectEl = document.getElementById('agent-action-select');
+  if (!selectEl) return;
+  const value = selectEl.value;
+  if (!value) return;
+
+  if (value.startsWith('prompt:')) {
+    selectEl.value = '';
+    quickPrompt(value.slice(7));
+    return;
+  }
+
+  if (value === 'component-prompt') {
+    loadComponentIntegrationPrompt();
+  } else if (value === 'security-target') {
+    promptSecurityTarget();
+  } else if (value === 'new-chat') {
+    startNewChat();
+  }
+
+  selectEl.value = '';
+}
 
 function describeActiveModel() {
   if (selectedModelProvider === MODEL_PROVIDERS.groq) return `Groq / ${selectedGroqModel}`;
   if (selectedModelProvider === MODEL_PROVIDERS.gemini) return 'Gemini';
   return 'OpenRouter';
+}
+
+function formatDiagnosticsLabel(diagnostics) {
+  const provider = String(diagnostics?.provider || '').trim();
+  const model = String(diagnostics?.model || '').trim();
+  const requestedProvider = String(diagnostics?.requested_provider || '').trim();
+
+  if (!provider && !model) return '';
+  const providerLabel = provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : 'Unknown';
+  const base = model ? `${providerLabel} / ${model}` : providerLabel;
+
+  if (requestedProvider && provider && requestedProvider !== provider) {
+    const requestedLabel = requestedProvider.charAt(0).toUpperCase() + requestedProvider.slice(1);
+    return `Resolved with ${base} (fallback from ${requestedLabel}).`;
+  }
+  return `Resolved with ${base}.`;
 }
 
 function promptSecurityTarget() {
@@ -2283,6 +2380,7 @@ function promptSecurityTarget() {
 
   const msg = `Run a full security scan on ${targetUrl}`;
   document.getElementById('agent-input').value = msg;
+  renderAgentCharCount();
   askAgent();
 }
 
@@ -2335,6 +2433,11 @@ async function runSecurityAgent(initialUserMsg) {
       throw e;
     } finally {
       agentRunState.abortController = null;
+    }
+
+    const diagnosticsLabel = formatDiagnosticsLabel(raw?.diagnostics);
+    if (diagnosticsLabel) {
+      addAgentMsg('system', diagnosticsLabel, [], { track: false });
     }
 
     const parsed = parseSecurityPayload(raw);
@@ -2463,6 +2566,7 @@ async function askAgent() {
     return;
   }
   inputEl.value = '';
+  renderAgentCharCount();
   if (!chatGoal) chatGoal = initialUserMsg;
 
   addAgentMsg('user', initialUserMsg);
@@ -2512,6 +2616,11 @@ async function askAgent() {
         throw e;
       } finally {
         agentRunState.abortController = null;
+      }
+
+      const diagnosticsLabel = formatDiagnosticsLabel(raw?.diagnostics);
+      if (diagnosticsLabel) {
+        addAgentMsg('system', diagnosticsLabel, [], { track: false });
       }
 
       const parsed = parseAgentPayload(raw);
@@ -2687,6 +2796,160 @@ async function callBackendJson(path, payload, options = {}) {
   return data;
 }
 
+function createFluidNoise() {
+  const permutation = [
+    151, 160, 137, 91, 90, 15, 131, 13, 201, 95, 96, 53, 194, 233, 7, 225, 140,
+    36, 103, 30, 69, 142, 8, 99, 37, 240, 21, 10, 23, 190, 6, 148, 247, 120,
+    234, 75, 0, 26, 197, 62, 94, 252, 219, 203, 117, 35, 11, 32, 57, 177, 33,
+    88, 237, 149, 56, 87, 174, 20, 125, 136, 171, 168, 68, 175, 74, 165, 71,
+    134, 139, 48, 27, 166, 77, 146, 158, 231, 83, 111, 229, 122, 60, 211, 133,
+    230, 220, 105, 92, 41, 55, 46, 245, 40, 244, 102, 143, 54, 65, 25, 63, 161,
+    1, 216, 80, 73, 209, 76, 132, 187, 208, 89, 18, 169, 200, 196, 135, 130,
+    116, 188, 159, 86, 164, 100, 109, 198, 173, 186, 3, 64, 52, 217, 226, 250,
+    124, 123, 5, 202, 38, 147, 118, 126, 255, 82, 85, 212, 207, 206, 59, 227,
+    47, 16, 58, 17, 182, 189, 28, 42, 223, 183, 170, 213, 119, 248, 152, 2, 44,
+    154, 163, 70, 221, 153, 101, 155, 167, 43, 172, 9, 129, 22, 39, 253, 19, 98,
+    108, 110, 79, 113, 224, 232, 178, 185, 112, 104, 218, 246, 97, 228, 251, 34,
+    242, 193, 238, 210, 144, 12, 191, 179, 162, 241, 81, 51, 145, 235, 249, 14,
+    239, 107, 49, 192, 214, 31, 181, 199, 106, 157, 184, 84, 204, 176, 115, 121,
+    50, 45, 127, 4, 150, 254, 138, 236, 205, 93, 222, 114, 67, 29, 24, 72, 243,
+    141, 128, 195, 78, 66, 215, 61, 156, 180
+  ];
+
+  const p = new Array(512);
+  for (let i = 0; i < 256; i += 1) p[256 + i] = p[i] = permutation[i];
+
+  function fade(t) {
+    return t * t * t * (t * (t * 6 - 15) + 10);
+  }
+
+  function lerp(t, a, b) {
+    return a + t * (b - a);
+  }
+
+  function grad(hash, x, y, z) {
+    const h = hash & 15;
+    const u = h < 8 ? x : y;
+    const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+    return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+  }
+
+  return {
+    simplex3(x, y, z) {
+      const X = Math.floor(x) & 255;
+      const Y = Math.floor(y) & 255;
+      const Z = Math.floor(z) & 255;
+
+      x -= Math.floor(x);
+      y -= Math.floor(y);
+      z -= Math.floor(z);
+
+      const u = fade(x);
+      const v = fade(y);
+      const w = fade(z);
+
+      const A = p[X] + Y;
+      const AA = p[A] + Z;
+      const AB = p[A + 1] + Z;
+      const B = p[X + 1] + Y;
+      const BA = p[B] + Z;
+      const BB = p[B + 1] + Z;
+
+      return lerp(
+        w,
+        lerp(
+          v,
+          lerp(u, grad(p[AA], x, y, z), grad(p[BA], x - 1, y, z)),
+          lerp(u, grad(p[AB], x, y - 1, z), grad(p[BB], x - 1, y - 1, z))
+        ),
+        lerp(
+          v,
+          lerp(u, grad(p[AA + 1], x, y, z - 1), grad(p[BA + 1], x - 1, y, z - 1)),
+          lerp(u, grad(p[AB + 1], x, y - 1, z - 1), grad(p[BB + 1], x - 1, y - 1, z - 1))
+        )
+      );
+    }
+  };
+}
+
+function initFluidBackground() {
+  const canvas = document.getElementById('fluid-bg-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d', { alpha: true });
+  if (!ctx) return;
+
+  const noise = createFluidNoise();
+  const particles = [];
+  let animationFrameId = 0;
+
+  function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+
+  resizeCanvas();
+
+  const particleCount = Math.min(1800, Math.max(900, Math.floor((canvas.width * canvas.height) / 850)));
+  for (let i = 0; i < particleCount; i += 1) {
+    particles.push({
+      x: Math.random() * canvas.width,
+      y: Math.random() * canvas.height,
+      size: Math.random() * 1.8 + 0.4,
+      velocity: { x: 0, y: 0 },
+      life: Math.random() * 100,
+      maxLife: 100 + Math.random() * 80
+    });
+  }
+
+  function animate() {
+    ctx.fillStyle = 'rgba(5, 7, 11, 0.16)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const time = Date.now() * 0.0001;
+    for (const particle of particles) {
+      particle.life += 1;
+      if (particle.life > particle.maxLife) {
+        particle.life = 0;
+        particle.x = Math.random() * canvas.width;
+        particle.y = Math.random() * canvas.height;
+      }
+
+      const opacity = Math.sin((particle.life / particle.maxLife) * Math.PI) * 0.15;
+      const flow = noise.simplex3(particle.x * 0.0028, particle.y * 0.0028, time);
+      const angle = flow * Math.PI * 4;
+
+      particle.velocity.x = Math.cos(angle) * 1.7;
+      particle.velocity.y = Math.sin(angle) * 1.7;
+      particle.x += particle.velocity.x;
+      particle.y += particle.velocity.y;
+
+      if (particle.x < 0) particle.x = canvas.width;
+      if (particle.x > canvas.width) particle.x = 0;
+      if (particle.y < 0) particle.y = canvas.height;
+      if (particle.y > canvas.height) particle.y = 0;
+
+      ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
+      ctx.beginPath();
+      ctx.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    animationFrameId = window.requestAnimationFrame(animate);
+  }
+
+  function handleResize() {
+    resizeCanvas();
+  }
+
+  window.addEventListener('resize', handleResize);
+  animate();
+
+  return () => {
+    window.cancelAnimationFrame(animationFrameId);
+    window.removeEventListener('resize', handleResize);
+  };
+}
+
 // New request
 document.getElementById('new-req-btn').addEventListener('click', () => {
   saveActive();
@@ -2743,10 +3006,14 @@ const origSendRequest = sendRequest;
 
 // Init
 (async function initApp() {
+  initFluidBackground();
   loadModelPreferences();
   await loadRuntimeConfig();
   loadActive();
+  renderWelcomeMessage();
   loadComponentIntegrationPrompt({ overwrite: false });
+  renderAgentPanelState();
+  renderAgentCharCount();
   renderSidebar();
   renderModelProvider();
   renderScanPaceControl();

@@ -8,13 +8,16 @@
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+<canvas id="fluid-bg-canvas" class="fluid-bg-canvas" aria-hidden="true"></canvas>
+<div class="fluid-bg-wash" aria-hidden="true"></div>
 
+<div class="page-shell">
 <div class="topbar">
   <div class="logo">
     <div class="logo-dot"></div>
     AgentMan
   </div>
-  <span class="topbar-version">v1.0 — Agentic API IDE</span>
+  <span class="topbar-version">Fluid Workspace — Agentic API IDE</span>
   <div class="topbar-spacer"></div>
   <div class="status-pill">
     <div class="status-dot"></div>
@@ -115,96 +118,119 @@
   </div>
 
   <!-- AGENT PANEL -->
-  <div class="agent-panel">
-    <div class="agent-header">
-      <div class="agent-icon">✦</div>
-      <div>
-        <div class="agent-title">API Agent</div>
-        <div class="agent-sub">Generate · Chain · Debug · Assert</div>
-        <div class="agent-mode-switch" id="agent-mode-switch">
-          <button class="mode-btn active" data-mode="agent" onclick="setAgentMode('agent')">Agent</button>
-          <button class="mode-btn" data-mode="planning" onclick="setAgentMode('planning')">Planning</button>
-          <button class="mode-btn" data-mode="ask" onclick="setAgentMode('ask')">Ask</button>
+  <div class="agent-panel open">
+    <div class="agent-ambient-glow"></div>
+    <div class="agent-card" id="agent-card">
+        <div class="agent-card-header">
+          <div class="agent-card-status">
+            <span class="agent-status-dot"></span>
+            <span class="agent-status-label">AI Assistant</span>
+          </div>
+          <div class="agent-card-badges">
+            <span class="agent-badge" id="agent-model-badge">OpenRouter</span>
+          </div>
         </div>
-      </div>
-    </div>
-    <div class="agent-messages" id="agent-messages">
-      <div class="scan-progress-panel" id="scan-progress-panel" style="display:none;">
-        <div class="scan-progress-head">
-          <span class="scan-progress-title">Scan Progress</span>
-          <span class="scan-progress-status" id="scan-progress-status">IDLE</span>
+
+        <div class="agent-card-topline">
+          <div class="agent-title-row">
+            <div class="agent-title">Homepage Assistant</div>
+            <div class="agent-sub">Generate · Chain · Debug · Assert</div>
+          </div>
+          <div class="agent-mode-switch" id="agent-mode-switch">
+            <button class="mode-btn active" data-mode="agent" onclick="setAgentMode('agent')">Agent</button>
+            <button class="mode-btn" data-mode="planning" onclick="setAgentMode('planning')">Planning</button>
+            <button class="mode-btn" data-mode="ask" onclick="setAgentMode('ask')">Ask</button>
+          </div>
         </div>
-        <div class="scan-progress-target" id="scan-progress-target">No active scan</div>
-        <div class="scan-progress-bar-wrap">
-          <div class="scan-progress-bar" id="scan-progress-bar"></div>
+
+        <div class="agent-messages" id="agent-messages">
+          <div class="scan-progress-panel" id="scan-progress-panel" style="display:none;">
+            <div class="scan-progress-head">
+              <span class="scan-progress-title">Scan Progress</span>
+              <span class="scan-progress-status" id="scan-progress-status">IDLE</span>
+            </div>
+            <div class="scan-progress-target" id="scan-progress-target">No active scan</div>
+            <div class="scan-progress-bar-wrap">
+              <div class="scan-progress-bar" id="scan-progress-bar"></div>
+            </div>
+            <div class="scan-progress-meta" id="scan-progress-meta">0/0 steps</div>
+            <div class="scan-progress-counts" id="scan-progress-counts">
+              <span class="scan-badge scan-badge-pass" id="scan-badge-pass">Pass 0</span>
+              <span class="scan-badge scan-badge-fail" id="scan-badge-fail">Fail 0</span>
+              <span class="scan-badge scan-badge-skip" id="scan-badge-skip">Skip 0</span>
+            </div>
+            <div class="scan-progress-finished" id="scan-progress-finished">Last finished: —</div>
+          </div>
         </div>
-        <div class="scan-progress-meta" id="scan-progress-meta">0/0 steps</div>
-        <div class="scan-progress-counts" id="scan-progress-counts">
-          <span class="scan-badge scan-badge-pass" id="scan-badge-pass">Pass 0</span>
-          <span class="scan-badge scan-badge-fail" id="scan-badge-fail">Fail 0</span>
-          <span class="scan-badge scan-badge-skip" id="scan-badge-skip">Skip 0</span>
+
+        <div class="agent-input-area">
+          <textarea class="agent-textarea" id="agent-input" placeholder="Describe a request. Agent mode will apply and auto-run generated request actions." rows="3"></textarea>
+
+          <div class="agent-toolbar">
+            <div class="agent-toolbar-left">
+              <label class="agent-toolbar-label" for="agent-action-select">Quick action</label>
+              <select class="agent-action-select" id="agent-action-select">
+                <option value="">Choose an action…</option>
+                <option value="prompt:Debug the last error">Debug the last error</option>
+                <option value="prompt:Generate test assertions for the last response">Generate assertions</option>
+                <option value="prompt:Chain another request using the response data">Chain from response</option>
+                <option value="component-prompt">Load component prompt</option>
+                <option value="security-target">Security scan target</option>
+                <option value="new-chat">Start new chat</option>
+              </select>
+              <button class="agent-toolbar-apply" type="button" onclick="runSelectedAgentAction()">Apply</button>
+            </div>
+            <div class="agent-char-count"><span id="agent-char-count">0</span>/<span id="agent-char-max">2000</span></div>
+          </div>
+
+          <div class="agent-controls-row">
+            <div class="agent-send-cluster">
+              <button class="agent-send" id="agent-send-btn">Send ↗</button>
+              <button class="agent-stop" id="agent-stop-btn" onclick="requestStopAgentRun()" disabled>Stop</button>
+            </div>
+          </div>
+
+          <div class="provider-toolbar">
+            <div class="model-select-row">
+              <label for="model-provider-select" class="provider-label">Provider</label>
+              <select class="model-provider-select" id="model-provider-select" onchange="setModelProvider(this.value)">
+                <option value="openrouter">OpenRouter</option>
+                <option value="gemini">Gemini</option>
+                <option value="groq">Groq</option>
+              </select>
+            </div>
+            <div class="model-select-row" id="groq-model-row" style="display:none;">
+              <label for="groq-model-select" class="provider-label">Groq Model</label>
+              <select class="model-provider-select" id="groq-model-select" onchange="setGroqModel(this.value)">
+                <option value="groq/compound">groq/compound</option>
+                <option value="groq/compound-mini">groq/compound-mini</option>
+                <option value="groq/gpt-oss-120b">groq/gpt-oss-120b</option>
+                <option value="groq/gpt-oss-20b">groq/gpt-oss-20b</option>
+                <option value="groq/gpt-oss-safeguard-20b">groq/gpt-oss-safeguard-20b</option>
+                <option value="groq/qwen3-32b">groq/qwen3-32b</option>
+              </select>
+            </div>
+            <div class="model-select-row" id="scan-pace-row">
+              <label for="scan-pace-select" class="provider-label">Scan Pace</label>
+              <select class="model-provider-select" id="scan-pace-select" onchange="setScanPace(this.value)">
+                <option value="0">No delay</option>
+                <option value="2000">2s</option>
+                <option value="5000">5s</option>
+                <option value="8000">8s</option>
+                <option value="adaptive">Adaptive</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="agent-footer">
+            <div class="agent-footer-hint">Press <kbd>Shift + Enter</kbd> for new line</div>
+            <div class="agent-footer-health"><span class="agent-footer-health-dot"></span>All systems operational</div>
+          </div>
         </div>
-        <div class="scan-progress-finished" id="scan-progress-finished">Last finished: —</div>
-      </div>
-      <div class="msg agent">
-        <div class="msg-role">Agent</div>
-        <div class="msg-bubble">
-          Hi! I can help you build API requests from plain English. Try something like:<br><br>
-          <em style="color:var(--text2);">"GET all users from JSONPlaceholder"</em><br>
-          <em style="color:var(--text2);">"POST a new todo with a random title"</em><br>
-          <em style="color:var(--text2);">"Chain: get user 1, then fetch their posts"</em><br><br>
-          I can also auto-debug errors and generate test assertions.
-        </div>
-      </div>
-    </div>
-    <div class="agent-input-area">
-      <div class="agent-actions">
-        <button class="quick-btn" onclick="quickPrompt('Debug the last error')">🔍 Debug</button>
-        <button class="quick-btn" onclick="quickPrompt('Generate test assertions for the last response')">✓ Assert</button>
-        <button class="quick-btn" onclick="quickPrompt('Chain another request using the response data')">⛓ Chain</button>
-        <button class="quick-btn" onclick="loadComponentIntegrationPrompt()">◫ Component Prompt</button>
-        <button class="quick-btn" onclick="promptSecurityTarget()">🛡 Security</button>
-        <button class="quick-btn" onclick="startNewChat()">✦ New Chat</button>
-      </div>
-      <div class="provider-toolbar">
-        <div class="model-select-row">
-          <label for="model-provider-select" class="provider-label">Provider</label>
-          <select class="model-provider-select" id="model-provider-select" onchange="setModelProvider(this.value)">
-            <option value="openrouter">OpenRouter</option>
-            <option value="gemini">Gemini</option>
-            <option value="groq">Groq</option>
-          </select>
-        </div>
-        <div class="model-select-row" id="groq-model-row" style="display:none;">
-          <label for="groq-model-select" class="provider-label">Groq Model</label>
-          <select class="model-provider-select" id="groq-model-select" onchange="setGroqModel(this.value)">
-            <option value="groq/compound">groq/compound</option>
-            <option value="groq/compound-mini">groq/compound-mini</option>
-            <option value="groq/gpt-oss-120b">groq/gpt-oss-120b</option>
-            <option value="groq/gpt-oss-20b">groq/gpt-oss-20b</option>
-            <option value="groq/gpt-oss-safeguard-20b">groq/gpt-oss-safeguard-20b</option>
-            <option value="groq/qwen3-32b">groq/qwen3-32b</option>
-          </select>
-        </div>
-        <div class="model-select-row" id="scan-pace-row">
-          <label for="scan-pace-select" class="provider-label">Scan Pace</label>
-          <select class="model-provider-select" id="scan-pace-select" onchange="setScanPace(this.value)">
-            <option value="0">No delay</option>
-            <option value="2000">2s</option>
-            <option value="5000">5s</option>
-            <option value="8000">8s</option>
-            <option value="adaptive">Adaptive</option>
-          </select>
-        </div>
-      </div>
-      <textarea class="agent-textarea" id="agent-input" placeholder="Describe a request, ask to debug, chain, or generate assertions..." rows="3"></textarea>
-      <div class="agent-send-row">
-        <button class="agent-send" id="agent-send-btn">Ask Agent ↗</button>
-        <button class="agent-stop" id="agent-stop-btn" onclick="requestStopAgentRun()" disabled>Stop</button>
-      </div>
     </div>
   </div>
 
+</div>
 </div>
 
 <script src="app.js"></script>

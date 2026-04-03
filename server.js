@@ -26,19 +26,22 @@ const OPENROUTER_MODELS = {
 };
 
 const GEMINI_MODELS = {
-  default: process.env.GEMINI_DEFAULT_MODEL || 'gemini-flash-latest',
-  advanced: process.env.GEMINI_ADVANCED_MODEL || 'gemini-flash-latest',
-  security: process.env.GEMINI_SECURITY_MODEL || 'gemini-flash-latest'
+  default: process.env.GEMINI_DEFAULT_MODEL || 'gemini-2.5-flash',
+  advanced: process.env.GEMINI_ADVANCED_MODEL || 'gemini-2.5-flash',
+  security: process.env.GEMINI_SECURITY_MODEL || 'gemini-2.5-flash'
 };
 
 const GEMINI_FALLBACK_MODELS = [
-  'gemini-flash-latest',
-  'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
-  'gemini-1.5-flash',
-  'gemini-1.5-flash-8b',
-  'gemini-1.5-pro'
+  'gemini-2.5-flash'
 ];
+const GEMINI_MODEL_ALIASES = {
+  'gemini-flash-latest': 'gemini-2.5-flash',
+  'gemini-2.0-flash': 'gemini-2.5-flash',
+  'gemini-2.0-flash-lite': 'gemini-2.5-flash',
+  'gemini-1.5-flash': 'gemini-2.5-flash',
+  'gemini-1.5-flash-8b': 'gemini-2.5-flash',
+  'gemini-1.5-pro': 'gemini-2.5-flash'
+};
 
 const GROQ_MODEL_ALIASES = {
   'groq/compound': 'groq/compound',
@@ -63,6 +66,7 @@ const GROQ_MODEL_ORDER = [
   'groq/compound-mini',
   'groq/qwen3-32b'
 ];
+const GEMINI_REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_REQUEST_TIMEOUT_MS || 12000);
 
 const TASK_TYPES = {
   agent: 'agent',
@@ -708,11 +712,16 @@ function buildOpenRouterModelCandidates(requestedModel, taskType = TASK_TYPES.ag
 }
 
 function parseGeminiModel(model, profile = 'default', taskType = TASK_TYPES.agent) {
-  if (typeof model === 'string' && model.trim()) return model.trim().replace(/^models\//, '');
-  if (taskType === TASK_TYPES.security) return GEMINI_MODELS.security;
-  if (profile === 'security') return GEMINI_MODELS.security;
-  if (profile === 'advanced') return GEMINI_MODELS.advanced;
-  return GEMINI_MODELS.default;
+  const requested = typeof model === 'string' && model.trim()
+    ? model.trim().replace(/^models\//, '')
+    : '';
+  if (requested) {
+    return GEMINI_MODEL_ALIASES[requested] || requested;
+  }
+  if (taskType === TASK_TYPES.security) return GEMINI_MODEL_ALIASES[GEMINI_MODELS.security] || GEMINI_MODELS.security;
+  if (profile === 'security') return GEMINI_MODEL_ALIASES[GEMINI_MODELS.security] || GEMINI_MODELS.security;
+  if (profile === 'advanced') return GEMINI_MODEL_ALIASES[GEMINI_MODELS.advanced] || GEMINI_MODELS.advanced;
+  return GEMINI_MODEL_ALIASES[GEMINI_MODELS.default] || GEMINI_MODELS.default;
 }
 
 function buildGeminiModelCandidates(requestedModel, profile = 'default', taskType = TASK_TYPES.agent) {
@@ -859,6 +868,19 @@ function isGeminiQuotaError(error) {
     || msg.includes('free_tier');
 }
 
+function isGeminiTransientError(status, message) {
+  const code = Number(status || 0);
+  const msg = String(message || '').toLowerCase();
+  return code === 500
+    || code === 502
+    || code === 503
+    || code === 504
+    || msg.includes('high demand')
+    || msg.includes('temporarily unavailable')
+    || msg.includes('try again later')
+    || msg.includes('unavailable');
+}
+
 async function openRouterGenerateJson({ model, systemPrompt, userContent, temperature = 0.2, maxTokens = 1000 }) {
   assertApiKeyConfigured(MODEL_PROVIDERS.openrouter);
 
@@ -923,7 +945,7 @@ async function geminiGenerateJson({
   userContent,
   temperature = 0.2,
   maxTokens = 1000,
-  fallbackTokens = [900, 800, 700, 600]
+  fallbackTokens = [800, 600]
 }) {
   assertApiKeyConfigured(MODEL_PROVIDERS.gemini);
 
@@ -932,17 +954,17 @@ async function geminiGenerateJson({
   const mimeModes = [true, false];
   let lastRetryableError = null;
 
+  candidateLoop:
   for (const candidateModel of modelCandidates) {
     const candidateStats = getModelRuntimeStats(MODEL_PROVIDERS.gemini, candidateModel);
     const tokenPlan = buildAdaptiveTokenPlan(maxTokens, fallbackTokens, candidateStats);
 
     for (const tokens of tokenPlan) {
       for (const apiVersion of apiVersions) {
-      for (const withJsonMime of mimeModes) {
+        for (const withJsonMime of mimeModes) {
         const requestModes = [
-          { snakeCase: false, includeSystemInstruction: true },
-          { snakeCase: true, includeSystemInstruction: true },
           { snakeCase: false, includeSystemInstruction: false },
+          { snakeCase: false, includeSystemInstruction: true },
           { snakeCase: true, includeSystemInstruction: false }
         ];
 
@@ -958,26 +980,63 @@ async function geminiGenerateJson({
           includeSystemInstruction: mode.includeSystemInstruction
         });
 
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-goog-api-key': GEMINI_API_KEY
-          },
-          body: JSON.stringify(payload)
-        });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS);
+
+        let response;
+        try {
+          response = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-goog-api-key': GEMINI_API_KEY
+            },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+          });
+        } catch (error) {
+          clearTimeout(timeoutId);
+          const err = new Error(error?.name === 'AbortError'
+            ? `Gemini request timed out after ${GEMINI_REQUEST_TIMEOUT_MS}ms.`
+            : `Gemini request failed: ${String(error?.message || 'Unknown error')}`);
+          err.status = error?.name === 'AbortError' ? 504 : 502;
+          lastRetryableError = err;
+          recordModelAttempt({
+            provider: MODEL_PROVIDERS.gemini,
+            model: candidateModel,
+            taskType,
+            ok: false,
+            error: err
+          });
+          continue candidateLoop;
+        }
 
         let data;
         try {
           data = await response.json();
         } catch {
+          clearTimeout(timeoutId);
           const err = new Error('Gemini API returned a non-JSON response.');
           err.status = 502;
           throw err;
         }
+        clearTimeout(timeoutId);
 
         if (!response.ok) {
           const message = data?.error?.message || `Gemini API error (${response.status}).`;
+          if (isGeminiTransientError(response.status, message)) {
+            const err = new Error(message);
+            err.status = response.status;
+            lastRetryableError = err;
+            recordModelAttempt({
+              provider: MODEL_PROVIDERS.gemini,
+              model: candidateModel,
+              taskType,
+              ok: false,
+              error: err
+            });
+            continue candidateLoop;
+          }
           if (isGeminiRetryableModelError(response.status, message)) {
             const err = new Error(message);
             err.status = response.status;
@@ -989,7 +1048,7 @@ async function geminiGenerateJson({
               ok: false,
               error: err
             });
-            continue;
+            continue candidateLoop;
           }
           if (isGeminiSchemaFieldError(message)) {
             const err = new Error(message);
@@ -1024,7 +1083,11 @@ async function geminiGenerateJson({
             taskType,
             ok: true
           });
-          return text;
+          return {
+            raw: text,
+            provider: MODEL_PROVIDERS.gemini,
+            model: candidateModel
+          };
         }
 
         const err = new Error('Gemini API returned an unexpected content shape.');
@@ -1185,7 +1248,11 @@ async function groqGenerateJsonWithFallback({
           taskType,
           ok: true
         });
-        return raw;
+        return {
+          raw,
+          provider: MODEL_PROVIDERS.groq,
+          model: candidateModel
+        };
       } catch (error) {
         recordModelAttempt({
           provider: MODEL_PROVIDERS.groq,
@@ -1259,7 +1326,11 @@ async function openRouterGenerateJsonWithFallback({
           taskType,
           ok: true
         });
-        return raw;
+        return {
+          raw,
+          provider: MODEL_PROVIDERS.openrouter,
+          model: candidateModel
+        };
       } catch (error) {
         recordModelAttempt({
           provider: MODEL_PROVIDERS.openrouter,
@@ -1316,6 +1387,21 @@ function resolveModelSelection({ provider, requestedModel, profile = 'default', 
   return {
     preferred: candidates[0] || parseOpenRouterModel(null),
     candidates
+  };
+}
+
+function normalizeGenerationResult(result, fallbackProvider, fallbackModel) {
+  if (typeof result === 'string') {
+    return {
+      raw: result,
+      provider: fallbackProvider,
+      model: fallbackModel
+    };
+  }
+  return {
+    raw: String(result?.raw || ''),
+    provider: result?.provider || fallbackProvider,
+    model: result?.model || fallbackModel
   };
 }
 
@@ -1724,28 +1810,28 @@ app.post('/api/agent', async (req, res) => {
       const effectiveUserContent = userContentOverride || userContent;
       if (provider === MODEL_PROVIDERS.gemini) {
         try {
-          return await geminiGenerateJson({
+          return normalizeGenerationResult(await geminiGenerateJson({
             model: selection.preferred,
             profile: 'default',
             taskType: TASK_TYPES.agent,
             systemPrompt: effectiveSystemPrompt,
             userContent: effectiveUserContent
-          });
+          }), MODEL_PROVIDERS.gemini, selection.preferred);
         } catch (error) {
           if (!hasExplicitModel && isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
-            return await openRouterGenerateJsonWithFallback({
+            return normalizeGenerationResult(await openRouterGenerateJsonWithFallback({
               modelCandidates: buildOpenRouterModelCandidates(OPENROUTER_MODELS.default, TASK_TYPES.agent),
               taskType: TASK_TYPES.agent,
               systemPrompt: effectiveSystemPrompt,
               userContent: effectiveUserContent
-            });
+            }), MODEL_PROVIDERS.openrouter, OPENROUTER_MODELS.default);
           }
           throw error;
         }
       }
 
       if (provider === MODEL_PROVIDERS.groq) {
-        return await groqGenerateJsonWithFallback({
+        return normalizeGenerationResult(await groqGenerateJsonWithFallback({
           model: selection.preferred,
           profile: 'default',
           taskType: TASK_TYPES.agent,
@@ -1754,21 +1840,21 @@ app.post('/api/agent', async (req, res) => {
           userContent: effectiveUserContent,
           maxTokens: 1000,
           fallbackTokens: [800, 600, 500, 400, 300, 200]
-        });
+        }), MODEL_PROVIDERS.groq, selection.preferred);
       }
 
-      return await openRouterGenerateJsonWithFallback({
+      return normalizeGenerationResult(await openRouterGenerateJsonWithFallback({
         model: selection.preferred,
         modelCandidates: selection.candidates,
         taskType: TASK_TYPES.agent,
         systemPrompt: effectiveSystemPrompt,
         userContent: effectiveUserContent
-      });
+      }), MODEL_PROVIDERS.openrouter, selection.preferred);
     };
 
-    const initialRaw = await runAgentGeneration({});
+    const initialResult = await runAgentGeneration({});
     const repaired = await parseWithRepairLoop({
-      initialRaw,
+      initialRaw: initialResult.raw,
       parseFn: parseAgentPayload,
       buildRepairInput: ({ error, raw, attempt }) => {
         const repairSystemPrompt = `${systemPrompt}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON matching {\"message\": string, \"actions\": array}. Do not include markdown.`;
@@ -1784,10 +1870,10 @@ app.post('/api/agent', async (req, res) => {
         });
         return { repairSystemPrompt, repairUserContent };
       },
-      runRepair: async ({ repairSystemPrompt, repairUserContent }) => runAgentGeneration({
+      runRepair: async ({ repairSystemPrompt, repairUserContent }) => (await runAgentGeneration({
         systemPromptOverride: repairSystemPrompt,
         userContentOverride: repairUserContent
-      }),
+      })).raw,
       maxAttempts: 3
     });
     return res.json({
@@ -1795,8 +1881,10 @@ app.post('/api/agent', async (req, res) => {
       diagnostics: {
         ...repaired.diagnostics,
         engine: 'agent',
-        provider,
-        model: selection.preferred
+        provider: initialResult.provider,
+        model: initialResult.model,
+        requested_provider: provider,
+        requested_model: selection.preferred
       }
     });
   } catch (error) {
@@ -1838,28 +1926,28 @@ app.post('/api/assertions', async (req, res) => {
 
       if (provider === MODEL_PROVIDERS.gemini) {
         try {
-          return await geminiGenerateJson({
+          return normalizeGenerationResult(await geminiGenerateJson({
             model: selection.preferred,
             profile: 'default',
             taskType: TASK_TYPES.assertions,
             systemPrompt: effectiveSystemPrompt,
             userContent: effectiveUserContent
-          });
+          }), MODEL_PROVIDERS.gemini, selection.preferred);
         } catch (error) {
           if (!hasExplicitModel && isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
-            return await openRouterGenerateJsonWithFallback({
+            return normalizeGenerationResult(await openRouterGenerateJsonWithFallback({
               modelCandidates: buildOpenRouterModelCandidates(OPENROUTER_MODELS.default, TASK_TYPES.assertions),
               taskType: TASK_TYPES.assertions,
               systemPrompt: effectiveSystemPrompt,
               userContent: effectiveUserContent
-            });
+            }), MODEL_PROVIDERS.openrouter, OPENROUTER_MODELS.default);
           }
           throw error;
         }
       }
 
       if (provider === MODEL_PROVIDERS.groq) {
-        return await groqGenerateJsonWithFallback({
+        return normalizeGenerationResult(await groqGenerateJsonWithFallback({
           model: selection.preferred,
           profile: 'default',
           taskType: TASK_TYPES.assertions,
@@ -1868,21 +1956,21 @@ app.post('/api/assertions', async (req, res) => {
           userContent: effectiveUserContent,
           maxTokens: 800,
           fallbackTokens: [600, 500, 400, 300, 200]
-        });
+        }), MODEL_PROVIDERS.groq, selection.preferred);
       }
 
-      return await openRouterGenerateJsonWithFallback({
+      return normalizeGenerationResult(await openRouterGenerateJsonWithFallback({
         model: selection.preferred,
         modelCandidates: selection.candidates,
         taskType: TASK_TYPES.assertions,
         systemPrompt: effectiveSystemPrompt,
         userContent: effectiveUserContent
-      });
+      }), MODEL_PROVIDERS.openrouter, selection.preferred);
     };
 
-    const initialRaw = await runAssertionsGeneration({});
+    const initialResult = await runAssertionsGeneration({});
     const repaired = await parseWithRepairLoop({
-      initialRaw,
+      initialRaw: initialResult.raw,
       parseFn: parseAssertionsPayload,
       buildRepairInput: ({ error, raw, attempt }) => {
         const repairSystemPrompt = `${systemPrompt}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON matching {\"assertions\": string[]} with 4-6 assertions.`;
@@ -1894,10 +1982,10 @@ app.post('/api/assertions', async (req, res) => {
         });
         return { repairSystemPrompt, repairUserContent };
       },
-      runRepair: async ({ repairSystemPrompt, repairUserContent }) => runAssertionsGeneration({
+      runRepair: async ({ repairSystemPrompt, repairUserContent }) => (await runAssertionsGeneration({
         systemPromptOverride: repairSystemPrompt,
         userContentOverride: repairUserContent
-      }),
+      })).raw,
       maxAttempts: 3
     });
 
@@ -1906,8 +1994,10 @@ app.post('/api/assertions', async (req, res) => {
       diagnostics: {
         ...repaired.diagnostics,
         engine: 'assertions',
-        provider,
-        model: selection.preferred
+        provider: initialResult.provider,
+        model: initialResult.model,
+        requested_provider: provider,
+        requested_model: selection.preferred
       }
     });
   } catch (error) {
@@ -1951,7 +2041,7 @@ app.post('/api/security-agent', async (req, res) => {
 
       if (provider === MODEL_PROVIDERS.gemini) {
         try {
-          return await geminiGenerateJson({
+          return normalizeGenerationResult(await geminiGenerateJson({
             model: selection.preferred,
             profile: 'security',
             taskType: TASK_TYPES.security,
@@ -1959,10 +2049,10 @@ app.post('/api/security-agent', async (req, res) => {
             userContent: effectiveUserContent,
             temperature: 0.1,
             maxTokens: 1200
-          });
+          }), MODEL_PROVIDERS.gemini, selection.preferred);
         } catch (error) {
           if (!hasExplicitModel && isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
-            return await openRouterGenerateJsonWithFallback({
+            return normalizeGenerationResult(await openRouterGenerateJsonWithFallback({
               modelCandidates: buildOpenRouterModelCandidates(OPENROUTER_MODELS.security, TASK_TYPES.security),
               taskType: TASK_TYPES.security,
               systemPrompt: effectiveSystemPrompt,
@@ -1970,14 +2060,14 @@ app.post('/api/security-agent', async (req, res) => {
               temperature: 0.1,
               maxTokens: 1400,
               fallbackTokens: [1200, 1000, 800, 600]
-            });
+            }), MODEL_PROVIDERS.openrouter, OPENROUTER_MODELS.security);
           }
           throw error;
         }
       }
 
       if (provider === MODEL_PROVIDERS.groq) {
-        return await groqGenerateJsonWithFallback({
+        return normalizeGenerationResult(await groqGenerateJsonWithFallback({
           model: selection.preferred,
           profile: 'security',
           taskType: TASK_TYPES.security,
@@ -1987,10 +2077,10 @@ app.post('/api/security-agent', async (req, res) => {
           temperature: 0.1,
           maxTokens: 800,
           fallbackTokens: [600, 500, 400, 300, 200]
-        });
+        }), MODEL_PROVIDERS.groq, selection.preferred);
       }
 
-      return await openRouterGenerateJsonWithFallback({
+      return normalizeGenerationResult(await openRouterGenerateJsonWithFallback({
         model: selection.preferred,
         modelCandidates: selection.candidates,
         taskType: TASK_TYPES.security,
@@ -1999,12 +2089,12 @@ app.post('/api/security-agent', async (req, res) => {
         temperature: 0.1,
         maxTokens: 1400,
         fallbackTokens: [1200, 1000, 800, 600]
-      });
+      }), MODEL_PROVIDERS.openrouter, selection.preferred);
     };
 
-    const initialRaw = await runSecurityGeneration({});
+    const initialResult = await runSecurityGeneration({});
     const repaired = await parseWithRepairLoop({
-      initialRaw,
+      initialRaw: initialResult.raw,
       parseFn: parseSecurityPayload,
       buildRepairInput: ({ error, raw, attempt }) => {
         const repairSystemPrompt = `${SECURITY_MASTER_PROMPT}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON with fields: message, threat_level, findings[], actions[].`;
@@ -2016,10 +2106,10 @@ app.post('/api/security-agent', async (req, res) => {
         });
         return { repairSystemPrompt, repairUserContent };
       },
-      runRepair: async ({ repairSystemPrompt, repairUserContent }) => runSecurityGeneration({
+      runRepair: async ({ repairSystemPrompt, repairUserContent }) => (await runSecurityGeneration({
         systemPromptOverride: repairSystemPrompt,
         userContentOverride: repairUserContent
-      }),
+      })).raw,
       maxAttempts: 3
     });
 
@@ -2028,8 +2118,10 @@ app.post('/api/security-agent', async (req, res) => {
       diagnostics: {
         ...repaired.diagnostics,
         engine: 'security',
-        provider,
-        model: selection.preferred
+        provider: initialResult.provider,
+        model: initialResult.model,
+        requested_provider: provider,
+        requested_model: selection.preferred
       }
     });
   } catch (error) {

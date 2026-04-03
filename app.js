@@ -1183,6 +1183,162 @@ function readJsonPath(json, path) {
   return tokens.reduce((acc, token) => (acc == null ? undefined : acc[token]), json);
 }
 
+function resolveScanTargetUrl(scanPlan) {
+  const activeUrl = String(getActive()?.url || '').trim();
+  const scanTarget = String(scanPlan?.target || '').trim();
+  const invalidTarget = !scanTarget
+    || /api\.example\.com/i.test(scanTarget)
+    || /\{id\}/i.test(scanTarget)
+    || /\{.+\}/.test(scanTarget);
+
+  if (!invalidTarget) return scanTarget;
+  if (activeUrl) return activeUrl;
+  return scanTarget || '';
+}
+
+function buildDeterministicProbeForScanStep(scanPlan, planStep) {
+  const targetUrl = resolveScanTargetUrl(scanPlan);
+  if (!targetUrl) return null;
+
+  const vector = String(planStep?.vector || '').trim() || 'Unknown';
+  const baseProbe = {
+    type: 'probe',
+    name: `${vector} probe`,
+    method: 'GET',
+    url: targetUrl,
+    headers: [],
+    params: [],
+    body: '',
+    vector,
+    hypothesis: '',
+    auto_chain: false
+  };
+
+  switch (vector) {
+    case 'InfoDisclosure':
+      return {
+        ...baseProbe,
+        name: 'Unauthenticated access check',
+        hypothesis: 'A positive result is a 200 response, verbose headers, or sensitive data exposure without authentication.'
+      };
+    case 'AuthBypass':
+      return {
+        ...baseProbe,
+        name: 'Auth bypass header check',
+        headers: [
+          { k: 'X-Forwarded-For', v: '127.0.0.1' },
+          { k: 'X-Original-URL', v: '/' },
+          { k: 'Authorization', v: 'Bearer undefined' }
+        ],
+        hypothesis: 'A positive result is access granted or a materially different response when bypass-style headers are supplied.'
+      };
+    case 'IDOR':
+    case 'BOLA':
+      return {
+        ...baseProbe,
+        name: `${vector} identifier manipulation`,
+        params: [{ k: 'id', v: '99999' }],
+        hypothesis: 'A positive result is access to another object, different authorization behavior, or unexpected data for a manipulated identifier.'
+      };
+    case 'SQLi':
+      return {
+        ...baseProbe,
+        name: 'SQL injection query check',
+        params: [{ k: 'id', v: "' OR 1=1 --" }],
+        hypothesis: 'A positive result is an error signature, altered response shape, or unexpected success on an injected parameter.'
+      };
+    case 'NoSQLi':
+      return {
+        ...baseProbe,
+        name: 'NoSQL injection body check',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/json' }],
+        body: JSON.stringify({ username: { $gt: '' }, password: { $gt: '' } }, null, 2),
+        hypothesis: 'A positive result is authentication bypass or unexpected acceptance of object operators in JSON input.'
+      };
+    case 'MassAssignment':
+      return {
+        ...baseProbe,
+        name: 'Mass assignment field injection',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/json' }],
+        body: JSON.stringify({ role: 'admin', isAdmin: true }, null, 2),
+        hypothesis: 'A positive result is privileged fields being accepted or reflected without server-side filtering.'
+      };
+    case 'PathTraversal':
+      return {
+        ...baseProbe,
+        name: 'Path traversal filename check',
+        params: [{ k: 'file', v: '../../etc/passwd' }],
+        hypothesis: 'A positive result is local file content, traversal error leakage, or unusual file resolution behavior.'
+      };
+    case 'CachePoisoning':
+      return {
+        ...baseProbe,
+        name: 'Cache poisoning header check',
+        headers: [{ k: 'X-Forwarded-Host', v: 'evil.example' }],
+        hypothesis: 'A positive result is reflected untrusted host data or cache-affecting behavior driven by inbound headers.'
+      };
+    case 'UnrestrictedUpload':
+      return {
+        ...baseProbe,
+        name: 'Upload metadata acceptance check',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/json' }],
+        body: JSON.stringify({ filename: 'shell.php', contentType: 'application/x-php' }, null, 2),
+        hypothesis: 'A positive result is acceptance of risky file metadata or weak validation on upload-related inputs.'
+      };
+    case 'SSRF':
+      return {
+        ...baseProbe,
+        name: 'SSRF URL parameter check',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/json' }],
+        body: JSON.stringify({ url: 'http://169.254.169.254/latest/meta-data/' }, null, 2),
+        hypothesis: 'A positive result is server-side fetching behavior, internal host access, or metadata-service related errors.'
+      };
+    case 'XXE':
+      return {
+        ...baseProbe,
+        name: 'XXE XML payload check',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/xml' }],
+        body: '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>',
+        hypothesis: 'A positive result is XML parser expansion, local file disclosure, or parser errors revealing external entity handling.'
+      };
+    case 'ParameterPollution':
+      return {
+        ...baseProbe,
+        name: 'Duplicate parameter pollution check',
+        params: [
+          { k: 'id', v: '1' },
+          { k: 'id', v: '2' }
+        ],
+        hypothesis: 'A positive result is inconsistent routing, merged parameter handling, or unexpected precedence between duplicate parameters.'
+      };
+    case 'CommandInjection':
+      return {
+        ...baseProbe,
+        name: 'Command injection input check',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/json' }],
+        body: JSON.stringify({ input: 'test; id' }, null, 2),
+        hypothesis: 'A positive result is shell error leakage, command output, or execution timing anomalies tied to command separators.'
+      };
+    case 'BusinessLogic':
+      return {
+        ...baseProbe,
+        name: 'Business logic abuse input check',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/json' }],
+        body: JSON.stringify({ quantity: -1, price: 0, role: 'premium' }, null, 2),
+        hypothesis: 'A positive result is acceptance of impossible state transitions, negative values, or privilege-changing business fields.'
+      };
+    default:
+      return null;
+  }
+}
+
 function canAutoRunProbe(action) {
   return false;
 }
@@ -1285,6 +1441,17 @@ async function executeProbeChain(action, options = {}) {
 }
 
 async function generateProbeForScanStep(scanPlan, planStep) {
+  const deterministicProbe = buildDeterministicProbeForScanStep(scanPlan, planStep);
+  if (deterministicProbe) {
+    return {
+      probe: deterministicProbe,
+      chain: null,
+      message: `Prepared a deterministic ${deterministicProbe.vector} probe for step ${planStep.order || '?'}.`,
+      assertions: [],
+      hadRateLimit: false
+    };
+  }
+
   const r = getActive();
   const stepInstruction = [
     `Generate exactly one probe for scan plan step ${planStep.order || '?'} on target ${scanPlan.target || r.url}.`,

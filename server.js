@@ -1,5 +1,7 @@
 const path = require('path');
 const fs = require('fs');
+const net = require('net');
+const dns = require('dns').promises;
 const express = require('express');
 const dotenv = require('dotenv');
 
@@ -70,6 +72,53 @@ const TASK_TYPES = {
 
 const MODEL_CAPABILITY_REGISTRY_PATH = path.join(__dirname, 'model-capabilities.json');
 const MODEL_RUNTIME_STATS = new Map();
+const BLOCKED_HOSTNAMES = new Set([
+  'localhost',
+  'metadata.google.internal'
+]);
+const BLOCKED_HOST_SUFFIXES = [
+  '.localhost',
+  '.local',
+  '.internal',
+  '.home',
+  '.arpa'
+];
+const BLOCKED_CIDRS = [
+  '127.0.0.0/8',
+  '10.0.0.0/8',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+  '169.254.0.0/16',
+  '0.0.0.0/8',
+  '100.64.0.0/10',
+  '::1/128',
+  'fc00::/7',
+  'fe80::/10'
+];
+const BLOCKED_HEADER_NAMES = new Set([
+  'host',
+  'content-length',
+  'connection',
+  'proxy-connection',
+  'upgrade',
+  'transfer-encoding',
+  'te',
+  'trailer',
+  'proxy-authorization',
+  'proxy-authenticate',
+  'proxy-agent',
+  'forwarded',
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'x-real-ip',
+  'cf-connecting-ip',
+  'true-client-ip',
+  'cookie',
+  'cookie2',
+  'set-cookie',
+  'authorization'
+]);
 
 function loadModelCapabilityRegistry() {
   try {
@@ -80,6 +129,112 @@ function loadModelCapabilityRegistry() {
     }
   } catch {}
   return {};
+}
+
+function ipv4ToInt(ip) {
+  return ip.split('.').reduce((acc, octet) => ((acc << 8) + Number(octet)) >>> 0, 0);
+}
+
+function normalizeIpv6(ip) {
+  if (!ip.includes(':')) return null;
+  const [headRaw, tailRaw] = ip.split('::');
+  const head = headRaw ? headRaw.split(':').filter(Boolean) : [];
+  const tail = tailRaw ? tailRaw.split(':').filter(Boolean) : [];
+
+  if (tail.length && tail[tail.length - 1].includes('.')) {
+    const v4 = tail.pop();
+    const octets = v4.split('.').map(Number);
+    if (octets.length !== 4 || octets.some(o => !Number.isInteger(o) || o < 0 || o > 255)) return null;
+    tail.push(((octets[0] << 8) | octets[1]).toString(16));
+    tail.push(((octets[2] << 8) | octets[3]).toString(16));
+  }
+
+  const missing = 8 - (head.length + tail.length);
+  const groups = ip.includes('::')
+    ? [...head, ...Array(Math.max(0, missing)).fill('0'), ...tail]
+    : [...head, ...tail];
+
+  if (groups.length !== 8) return null;
+
+  return groups.map(group => group.padStart(4, '0')).join('');
+}
+
+function isIpv4InCidr(ip, cidrIp, prefix) {
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  return (ipv4ToInt(ip) & mask) === (ipv4ToInt(cidrIp) & mask);
+}
+
+function isIpv6InCidr(ip, cidrIp, prefix) {
+  const ipHex = normalizeIpv6(ip);
+  const cidrHex = normalizeIpv6(cidrIp);
+  if (!ipHex || !cidrHex) return false;
+  const chars = Math.floor(prefix / 4);
+  const remainder = prefix % 4;
+  if (ipHex.slice(0, chars) !== cidrHex.slice(0, chars)) return false;
+  if (!remainder) return true;
+  const mask = 0xf << (4 - remainder);
+  return (parseInt(ipHex[chars], 16) & mask) === (parseInt(cidrHex[chars], 16) & mask);
+}
+
+function isIpBlocked(ip) {
+  const family = net.isIP(ip);
+  if (!family) return false;
+  return BLOCKED_CIDRS.some(cidr => {
+    const [range, prefixRaw] = cidr.split('/');
+    const prefix = Number(prefixRaw);
+    if (family === 4 && net.isIP(range) === 4) {
+      return isIpv4InCidr(ip, range, prefix);
+    }
+    if (family === 6 && net.isIP(range) === 6) {
+      return isIpv6InCidr(ip, range, prefix);
+    }
+    return false;
+  });
+}
+
+function isHostnameBlocked(hostname) {
+  const normalized = String(hostname || '').toLowerCase();
+  return BLOCKED_HOSTNAMES.has(normalized)
+    || BLOCKED_HOST_SUFFIXES.some(suffix => normalized.endsWith(suffix));
+}
+
+async function assertUrlAllowed(parsedUrl) {
+  const hostname = String(parsedUrl.hostname || '').toLowerCase();
+  if (!hostname) {
+    const err = new Error('URL is missing a hostname.');
+    err.status = 400;
+    throw err;
+  }
+  if (isHostnameBlocked(hostname) || isIpBlocked(hostname)) {
+    const err = new Error('Target host is blocked by outbound request policy.');
+    err.status = 403;
+    throw err;
+  }
+
+  let lookupResults;
+  try {
+    lookupResults = await dns.lookup(hostname, { all: true });
+  } catch {
+    return;
+  }
+
+  if (lookupResults.some(result => isIpBlocked(result.address))) {
+    const err = new Error('Resolved target address is blocked by outbound request policy.');
+    err.status = 403;
+    throw err;
+  }
+}
+
+function sanitizeOutboundHeaders(headers) {
+  const source = headers && typeof headers === 'object' ? headers : {};
+  const safe = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (typeof value !== 'string') continue;
+    const normalized = key.toLowerCase();
+    if (BLOCKED_HEADER_NAMES.has(normalized)) continue;
+    safe[key] = value;
+  }
+  return safe;
 }
 
 const MODEL_CAPABILITY_REGISTRY = loadModelCapabilityRegistry();
@@ -1164,49 +1319,269 @@ function resolveModelSelection({ provider, requestedModel, profile = 'default', 
   };
 }
 
-function parseAgentPayload(raw) {
-  let parsed;
-  try {
-    parsed = JSON.parse((raw || '').trim());
-  } catch {
-    const err = new Error('Model output was not valid JSON.');
+function parseJsonObjectLoose(raw) {
+  const text = String(raw || '').trim();
+  if (!text) {
+    const err = new Error('Model output was empty.');
     err.status = 502;
     throw err;
   }
 
-  if (!parsed || typeof parsed !== 'object') {
-    const err = new Error('Model output must be a JSON object.');
-    err.status = 502;
-    throw err;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch {}
+
+  const firstCurly = text.indexOf('{');
+  const lastCurly = text.lastIndexOf('}');
+  if (firstCurly >= 0 && lastCurly > firstCurly) {
+    const slice = text.slice(firstCurly, lastCurly + 1);
+    try {
+      const parsed = JSON.parse(slice);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch {}
   }
-  if (typeof parsed.message !== 'string' || !Array.isArray(parsed.actions)) {
+
+  const err = new Error('Model output was not valid JSON.');
+  err.status = 502;
+  throw err;
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function normalizeKVArray(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .filter(item => item && typeof item === 'object' && typeof item.k === 'string')
+    .map(item => ({
+      k: item.k,
+      v: typeof item.v === 'string' ? item.v : ''
+    }));
+}
+
+function validateAgentAction(action, index) {
+  if (!action || typeof action !== 'object') {
+    return { error: `actions[${index}] must be an object.` };
+  }
+
+  const allowedMethods = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
+  const type = action.type;
+  if (!isNonEmptyString(type)) {
+    return { error: `actions[${index}].type must be a non-empty string.` };
+  }
+
+  if (type === 'set_request') {
+    if (!allowedMethods.has(String(action.method || '').toUpperCase())) return { error: `actions[${index}] invalid method.` };
+    if (!isNonEmptyString(action.url)) return { error: `actions[${index}] missing url.` };
+    return {
+      value: {
+        type,
+        name: isNonEmptyString(action.name) ? action.name : 'Generated Request',
+        method: String(action.method).toUpperCase(),
+        url: action.url,
+        params: normalizeKVArray(action.params),
+        headers: normalizeKVArray(action.headers),
+        body: typeof action.body === 'string' ? action.body : ''
+      }
+    };
+  }
+
+  if (type === 'set_assertions') {
+    const assertions = Array.isArray(action.assertions)
+      ? action.assertions.filter(x => isNonEmptyString(x))
+      : [];
+    if (!assertions.length) return { error: `actions[${index}] has no valid assertions.` };
+    return { value: { type, assertions } };
+  }
+
+  if (type === 'chain_request') {
+    if (!allowedMethods.has(String(action.method || '').toUpperCase())) return { error: `actions[${index}] invalid method.` };
+    if (!isNonEmptyString(action.url) || !isNonEmptyString(action.name)) {
+      return { error: `actions[${index}] missing name/url.` };
+    }
+    return {
+      value: {
+        type,
+        name: action.name,
+        method: String(action.method).toUpperCase(),
+        url: action.url,
+        params: normalizeKVArray(action.params),
+        headers: normalizeKVArray(action.headers),
+        body: typeof action.body === 'string' ? action.body : '',
+        chainNote: typeof action.chainNote === 'string' ? action.chainNote : ''
+      }
+    };
+  }
+
+  if (type === 'debug_info') {
+    const findings = Array.isArray(action.findings)
+      ? action.findings.filter(x => isNonEmptyString(x))
+      : [];
+    if (!findings.length) return { error: `actions[${index}] has no valid findings.` };
+    return {
+      value: {
+        type,
+        findings,
+        fix: typeof action.fix === 'string' ? action.fix : '',
+        patch: action.patch && typeof action.patch === 'object' ? action.patch : undefined
+      }
+    };
+  }
+
+  return { error: `actions[${index}] unsupported type: ${type}.` };
+}
+
+function validateSecurityAction(action, index) {
+  if (!action || typeof action !== 'object') {
+    return { error: `actions[${index}] must be an object.` };
+  }
+
+  const type = action.type;
+  const allowedMethods = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
+  if (!isNonEmptyString(type)) return { error: `actions[${index}].type must be a non-empty string.` };
+
+  if (type === 'probe') {
+    const method = String(action.method || '').toUpperCase();
+    if (!allowedMethods.has(method) || !isNonEmptyString(action.url)) {
+      return { error: `actions[${index}] invalid probe method/url.` };
+    }
+    return {
+      value: {
+        type,
+        name: isNonEmptyString(action.name) ? action.name : 'Security probe',
+        method,
+        url: action.url,
+        headers: normalizeKVArray(action.headers),
+        params: normalizeKVArray(action.params),
+        body: typeof action.body === 'string' ? action.body : '',
+        vector: isNonEmptyString(action.vector) ? action.vector : 'Unknown',
+        hypothesis: typeof action.hypothesis === 'string' ? action.hypothesis : '',
+        auto_chain: Boolean(action.auto_chain)
+      }
+    };
+  }
+
+  if (type === 'probe_chain') {
+    const steps = Array.isArray(action.steps) ? action.steps : [];
+    if (!steps.length) return { error: `actions[${index}] probe_chain requires steps.` };
+    const normalizedSteps = [];
+    for (let i = 0; i < steps.length; i += 1) {
+      const step = steps[i];
+      const method = String(step?.method || '').toUpperCase();
+      if (!allowedMethods.has(method) || !isNonEmptyString(step?.url)) {
+        return { error: `actions[${index}].steps[${i}] invalid method/url.` };
+      }
+      normalizedSteps.push({
+        step: Number(step.step || i + 1),
+        name: isNonEmptyString(step.name) ? step.name : `Step ${i + 1}`,
+        method,
+        url: step.url,
+        headers: normalizeKVArray(step.headers),
+        body: typeof step.body === 'string' ? step.body : '',
+        vector: isNonEmptyString(step.vector) ? step.vector : 'Unknown',
+        hypothesis: typeof step.hypothesis === 'string' ? step.hypothesis : '',
+        extract: step.extract && typeof step.extract === 'object' ? step.extract : undefined
+      });
+    }
+    return {
+      value: {
+        type,
+        name: isNonEmptyString(action.name) ? action.name : 'Security probe chain',
+        steps: normalizedSteps
+      }
+    };
+  }
+
+  if (type === 'fuzz_list') {
+    const payloads = Array.isArray(action.payloads)
+      ? action.payloads.filter(x => isNonEmptyString(x))
+      : [];
+    if (!payloads.length) return { error: `actions[${index}] fuzz_list requires payloads.` };
+    return {
+      value: {
+        type,
+        vector: isNonEmptyString(action.vector) ? action.vector : 'Unknown',
+        target_param: typeof action.target_param === 'string' ? action.target_param : '',
+        target_location: typeof action.target_location === 'string' ? action.target_location : 'query',
+        payloads,
+        success_indicators: action.success_indicators && typeof action.success_indicators === 'object' ? action.success_indicators : {}
+      }
+    };
+  }
+
+  if (type === 'scan_plan') {
+    return {
+      value: {
+        type,
+        target: typeof action.target === 'string' ? action.target : '',
+        method_coverage: Array.isArray(action.method_coverage) ? action.method_coverage : [],
+        steps: Array.isArray(action.steps) ? action.steps : []
+      }
+    };
+  }
+
+  if (type === 'set_assertions') {
+    const assertions = Array.isArray(action.assertions)
+      ? action.assertions.filter(x => isNonEmptyString(x))
+      : [];
+    if (!assertions.length) return { error: `actions[${index}] has no valid assertions.` };
+    return { value: { type, assertions } };
+  }
+
+  if (type === 'debug_info') {
+    const findings = Array.isArray(action.findings)
+      ? action.findings.filter(x => isNonEmptyString(x))
+      : [];
+    if (!findings.length) return { error: `actions[${index}] has no valid findings.` };
+    return {
+      value: {
+        type,
+        findings,
+        fix: typeof action.fix === 'string' ? action.fix : '',
+        patch: action.patch && typeof action.patch === 'object' ? action.patch : undefined
+      }
+    };
+  }
+
+  return { error: `actions[${index}] unsupported type: ${type}.` };
+}
+
+function parseAgentPayload(raw) {
+  const parsed = parseJsonObjectLoose(raw);
+  if (!isNonEmptyString(parsed.message) || !Array.isArray(parsed.actions)) {
     const err = new Error('Model output is missing required fields: message/actions.');
     err.status = 502;
     throw err;
   }
-  return parsed;
+
+  const normalizedActions = [];
+  const errors = [];
+  parsed.actions.forEach((action, index) => {
+    const result = validateAgentAction(action, index);
+    if (result.error) errors.push(result.error);
+    else normalizedActions.push(result.value);
+  });
+
+  if (errors.length) {
+    const err = new Error(`Invalid agent actions: ${errors.join(' | ')}`);
+    err.status = 502;
+    throw err;
+  }
+
+  return {
+    message: parsed.message,
+    actions: normalizedActions
+  };
 }
 
 function parseSecurityPayload(raw) {
-  let parsed;
-  try {
-    parsed = JSON.parse((raw || '').trim());
-  } catch {
-    const err = new Error('Security model output was not valid JSON.');
-    err.status = 502;
-    throw err;
-  }
-
-  if (!parsed || typeof parsed !== 'object') {
-    const err = new Error('Security model output must be a JSON object.');
-    err.status = 502;
-    throw err;
-  }
-
+  const parsed = parseJsonObjectLoose(raw);
   const levels = new Set(['none', 'low', 'medium', 'high', 'critical']);
   const findingSeverities = new Set(['info', 'low', 'medium', 'high', 'critical']);
 
-  if (typeof parsed.message !== 'string') {
+  if (!isNonEmptyString(parsed.message)) {
     const err = new Error('Security model output is missing required field: message.');
     err.status = 502;
     throw err;
@@ -1222,6 +1597,7 @@ function parseSecurityPayload(raw) {
     throw err;
   }
 
+  const normalizedFindings = [];
   parsed.findings.forEach((finding, index) => {
     if (!finding || typeof finding !== 'object') {
       const err = new Error(`Security finding at index ${index} must be an object.`);
@@ -1233,9 +1609,94 @@ function parseSecurityPayload(raw) {
       err.status = 502;
       throw err;
     }
+    normalizedFindings.push({
+      id: typeof finding.id === 'string' ? finding.id : `FINDING-${String(index + 1).padStart(3, '0')}`,
+      vulnerability: typeof finding.vulnerability === 'string' ? finding.vulnerability : 'Unknown',
+      severity: finding.severity,
+      evidence: typeof finding.evidence === 'string' ? finding.evidence : '',
+      cve_hint: typeof finding.cve_hint === 'string' || finding.cve_hint === null ? finding.cve_hint : null,
+      remediation: typeof finding.remediation === 'string' ? finding.remediation : ''
+    });
   });
 
-  return parsed;
+  const normalizedActions = [];
+  const errors = [];
+  parsed.actions.forEach((action, index) => {
+    const result = validateSecurityAction(action, index);
+    if (result.error) errors.push(result.error);
+    else normalizedActions.push(result.value);
+  });
+  if (errors.length) {
+    const err = new Error(`Invalid security actions: ${errors.join(' | ')}`);
+    err.status = 502;
+    throw err;
+  }
+
+  return {
+    message: parsed.message,
+    threat_level: parsed.threat_level,
+    findings: normalizedFindings,
+    actions: normalizedActions
+  };
+}
+
+function parseAssertionsPayload(raw) {
+  const parsed = parseJsonObjectLoose(raw);
+  const assertions = Array.isArray(parsed?.assertions)
+    ? parsed.assertions.filter(x => isNonEmptyString(x))
+    : [];
+  if (!assertions.length) {
+    const err = new Error('Assertions payload is missing a non-empty assertions array.');
+    err.status = 502;
+    throw err;
+  }
+  return { assertions };
+}
+
+async function parseWithRepairLoop({
+  initialRaw,
+  parseFn,
+  buildRepairInput,
+  runRepair,
+  maxAttempts = 3
+}) {
+  let raw = initialRaw;
+  let lastError = null;
+  const diagnostics = {
+    attempts: 0,
+    repairCount: 0,
+    repaired: false,
+    errors: [],
+    maxAttempts,
+    status: 'pending'
+  };
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    diagnostics.attempts = attempt;
+    try {
+      const payload = parseFn(raw);
+      diagnostics.repaired = diagnostics.repairCount > 0;
+      diagnostics.status = diagnostics.repaired ? 'repaired' : 'valid';
+      return { payload, diagnostics };
+    } catch (error) {
+      lastError = error;
+      diagnostics.errors.push({
+        attempt,
+        message: String(error?.message || 'Unknown validation error')
+      });
+      if (attempt >= maxAttempts) {
+        error.diagnostics = diagnostics;
+        throw error;
+      }
+      const repairInput = buildRepairInput({ attempt, error, raw });
+      diagnostics.repairCount += 1;
+      raw = await runRepair(repairInput);
+    }
+  }
+
+  const fallbackError = lastError || new Error('Structured parse failed.');
+  fallbackError.diagnostics = diagnostics;
+  throw fallbackError;
 }
 
 app.post('/api/agent', async (req, res) => {
@@ -1258,52 +1719,86 @@ app.post('/api/agent', async (req, res) => {
 
     const systemPrompt = `${AGENT_MASTER_PROMPT}\n\n${MODE_RULES_PROMPT}\n\n${CONTEXT_AWARENESS_PROMPT}`;
     const userContent = JSON.stringify(context);
-    let raw;
-    
-    if (provider === MODEL_PROVIDERS.gemini) {
-      try {
-        raw = await geminiGenerateJson({
-          model: selection.preferred,
-          profile: 'default',
-          taskType: TASK_TYPES.agent,
-          systemPrompt,
-          userContent
-        });
-      } catch (error) {
-        if (!hasExplicitModel && isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
-          raw = await openRouterGenerateJsonWithFallback({
-            modelCandidates: buildOpenRouterModelCandidates(OPENROUTER_MODELS.default, TASK_TYPES.agent),
+    const runAgentGeneration = async ({ systemPromptOverride, userContentOverride }) => {
+      const effectiveSystemPrompt = systemPromptOverride || systemPrompt;
+      const effectiveUserContent = userContentOverride || userContent;
+      if (provider === MODEL_PROVIDERS.gemini) {
+        try {
+          return await geminiGenerateJson({
+            model: selection.preferred,
+            profile: 'default',
             taskType: TASK_TYPES.agent,
-            systemPrompt,
-            userContent
+            systemPrompt: effectiveSystemPrompt,
+            userContent: effectiveUserContent
           });
-        } else {
+        } catch (error) {
+          if (!hasExplicitModel && isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
+            return await openRouterGenerateJsonWithFallback({
+              modelCandidates: buildOpenRouterModelCandidates(OPENROUTER_MODELS.default, TASK_TYPES.agent),
+              taskType: TASK_TYPES.agent,
+              systemPrompt: effectiveSystemPrompt,
+              userContent: effectiveUserContent
+            });
+          }
           throw error;
         }
       }
-    } else if (provider === MODEL_PROVIDERS.groq) {
-      raw = await groqGenerateJsonWithFallback({
-        model: selection.preferred,
-        profile: 'default',
-        taskType: TASK_TYPES.agent,
-        allowModelFallback: !hasExplicitModel,
-        systemPrompt,
-        userContent,
-        maxTokens: 1000,
-        fallbackTokens: [800, 600, 500, 400, 300, 200]
-      });
-    } else {
-      raw = await openRouterGenerateJsonWithFallback({
+
+      if (provider === MODEL_PROVIDERS.groq) {
+        return await groqGenerateJsonWithFallback({
+          model: selection.preferred,
+          profile: 'default',
+          taskType: TASK_TYPES.agent,
+          allowModelFallback: !hasExplicitModel,
+          systemPrompt: effectiveSystemPrompt,
+          userContent: effectiveUserContent,
+          maxTokens: 1000,
+          fallbackTokens: [800, 600, 500, 400, 300, 200]
+        });
+      }
+
+      return await openRouterGenerateJsonWithFallback({
         model: selection.preferred,
         modelCandidates: selection.candidates,
         taskType: TASK_TYPES.agent,
-        systemPrompt,
-        userContent
+        systemPrompt: effectiveSystemPrompt,
+        userContent: effectiveUserContent
       });
-    }
+    };
 
-    const payload = parseAgentPayload(raw);
-    return res.json(payload);
+    const initialRaw = await runAgentGeneration({});
+    const repaired = await parseWithRepairLoop({
+      initialRaw,
+      parseFn: parseAgentPayload,
+      buildRepairInput: ({ error, raw, attempt }) => {
+        const repairSystemPrompt = `${systemPrompt}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON matching {\"message\": string, \"actions\": array}. Do not include markdown.`;
+        const repairUserContent = JSON.stringify({
+          task: 'repair_agent_output',
+          attempt,
+          validation_error: error.message,
+          original_output: String(raw || '').slice(0, 12000),
+          required_schema: {
+            message: 'string',
+            actions: ['set_request | set_assertions | chain_request | debug_info']
+          }
+        });
+        return { repairSystemPrompt, repairUserContent };
+      },
+      runRepair: async ({ repairSystemPrompt, repairUserContent }) => runAgentGeneration({
+        systemPromptOverride: repairSystemPrompt,
+        userContentOverride: repairUserContent
+      }),
+      maxAttempts: 3
+    });
+    return res.json({
+      ...repaired.payload,
+      diagnostics: {
+        ...repaired.diagnostics,
+        engine: 'agent',
+        provider,
+        model: selection.preferred
+      }
+    });
   } catch (error) {
     const status = Number(error.status || 500);
     return res.status(status).json({ error: error.message || 'Failed to process agent request.' });
@@ -1337,62 +1832,84 @@ app.post('/api/assertions', async (req, res) => {
 
     const systemPrompt = 'You are an API testing assistant. Return strict JSON only.';
     const userContent = JSON.stringify(instruction);
-    let raw;
-    
-    if (provider === MODEL_PROVIDERS.gemini) {
-      try {
-        raw = await geminiGenerateJson({
-          model: selection.preferred,
-          profile: 'default',
-          taskType: TASK_TYPES.assertions,
-          systemPrompt,
-          userContent
-        });
-      } catch (error) {
-        if (!hasExplicitModel && isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
-          raw = await openRouterGenerateJsonWithFallback({
-            modelCandidates: buildOpenRouterModelCandidates(OPENROUTER_MODELS.default, TASK_TYPES.assertions),
+    const runAssertionsGeneration = async ({ systemPromptOverride, userContentOverride }) => {
+      const effectiveSystemPrompt = systemPromptOverride || systemPrompt;
+      const effectiveUserContent = userContentOverride || userContent;
+
+      if (provider === MODEL_PROVIDERS.gemini) {
+        try {
+          return await geminiGenerateJson({
+            model: selection.preferred,
+            profile: 'default',
             taskType: TASK_TYPES.assertions,
-            systemPrompt,
-            userContent
+            systemPrompt: effectiveSystemPrompt,
+            userContent: effectiveUserContent
           });
-        } else {
+        } catch (error) {
+          if (!hasExplicitModel && isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
+            return await openRouterGenerateJsonWithFallback({
+              modelCandidates: buildOpenRouterModelCandidates(OPENROUTER_MODELS.default, TASK_TYPES.assertions),
+              taskType: TASK_TYPES.assertions,
+              systemPrompt: effectiveSystemPrompt,
+              userContent: effectiveUserContent
+            });
+          }
           throw error;
         }
       }
-    } else if (provider === MODEL_PROVIDERS.groq) {
-      raw = await groqGenerateJsonWithFallback({
-        model: selection.preferred,
-        profile: 'default',
-        taskType: TASK_TYPES.assertions,
-        allowModelFallback: !hasExplicitModel,
-        systemPrompt,
-        userContent,
-        maxTokens: 800,
-        fallbackTokens: [600, 500, 400, 300, 200]
-      });
-    } else {
-      raw = await openRouterGenerateJsonWithFallback({
+
+      if (provider === MODEL_PROVIDERS.groq) {
+        return await groqGenerateJsonWithFallback({
+          model: selection.preferred,
+          profile: 'default',
+          taskType: TASK_TYPES.assertions,
+          allowModelFallback: !hasExplicitModel,
+          systemPrompt: effectiveSystemPrompt,
+          userContent: effectiveUserContent,
+          maxTokens: 800,
+          fallbackTokens: [600, 500, 400, 300, 200]
+        });
+      }
+
+      return await openRouterGenerateJsonWithFallback({
         model: selection.preferred,
         modelCandidates: selection.candidates,
         taskType: TASK_TYPES.assertions,
-        systemPrompt,
-        userContent
+        systemPrompt: effectiveSystemPrompt,
+        userContent: effectiveUserContent
       });
-    }
+    };
 
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return res.status(502).json({ error: 'Assertion generator returned invalid JSON.' });
-    }
+    const initialRaw = await runAssertionsGeneration({});
+    const repaired = await parseWithRepairLoop({
+      initialRaw,
+      parseFn: parseAssertionsPayload,
+      buildRepairInput: ({ error, raw, attempt }) => {
+        const repairSystemPrompt = `${systemPrompt}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON matching {\"assertions\": string[]} with 4-6 assertions.`;
+        const repairUserContent = JSON.stringify({
+          task: 'repair_assertions_output',
+          attempt,
+          validation_error: error.message,
+          original_output: String(raw || '').slice(0, 10000)
+        });
+        return { repairSystemPrompt, repairUserContent };
+      },
+      runRepair: async ({ repairSystemPrompt, repairUserContent }) => runAssertionsGeneration({
+        systemPromptOverride: repairSystemPrompt,
+        userContentOverride: repairUserContent
+      }),
+      maxAttempts: 3
+    });
 
-    const assertions = Array.isArray(parsed?.assertions)
-      ? parsed.assertions.filter(x => typeof x === 'string' && x.trim())
-      : [];
-
-    return res.json({ assertions });
+    return res.json({
+      assertions: repaired.payload.assertions,
+      diagnostics: {
+        ...repaired.diagnostics,
+        engine: 'assertions',
+        provider,
+        model: selection.preferred
+      }
+    });
   } catch (error) {
     const status = Number(error.status || 500);
     return res.status(status).json({ error: error.message || 'Failed to generate assertions.' });
@@ -1427,60 +1944,94 @@ app.post('/api/security-agent', async (req, res) => {
       return res.status(400).json({ error: 'Missing security context object.' });
     }
 
-    let raw;
-    if (provider === MODEL_PROVIDERS.gemini) {
-      try {
-        raw = await geminiGenerateJson({
-          model: selection.preferred,
-          profile: 'security',
-          taskType: TASK_TYPES.security,
-          systemPrompt: SECURITY_MASTER_PROMPT,
-          userContent: JSON.stringify(context),
-          temperature: 0.1,
-          maxTokens: 1200
-        });
-      } catch (error) {
-        if (!hasExplicitModel && isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
-          raw = await openRouterGenerateJsonWithFallback({
-            modelCandidates: buildOpenRouterModelCandidates(OPENROUTER_MODELS.security, TASK_TYPES.security),
+    const securityUserContent = JSON.stringify(context);
+    const runSecurityGeneration = async ({ systemPromptOverride, userContentOverride }) => {
+      const effectiveSystemPrompt = systemPromptOverride || SECURITY_MASTER_PROMPT;
+      const effectiveUserContent = userContentOverride || securityUserContent;
+
+      if (provider === MODEL_PROVIDERS.gemini) {
+        try {
+          return await geminiGenerateJson({
+            model: selection.preferred,
+            profile: 'security',
             taskType: TASK_TYPES.security,
-            systemPrompt: SECURITY_MASTER_PROMPT,
-            userContent: JSON.stringify(context),
+            systemPrompt: effectiveSystemPrompt,
+            userContent: effectiveUserContent,
             temperature: 0.1,
-            maxTokens: 1400,
-            fallbackTokens: [1200, 1000, 800, 600]
+            maxTokens: 1200
           });
-        } else {
+        } catch (error) {
+          if (!hasExplicitModel && isGeminiQuotaError(error) && OPENROUTER_API_KEY) {
+            return await openRouterGenerateJsonWithFallback({
+              modelCandidates: buildOpenRouterModelCandidates(OPENROUTER_MODELS.security, TASK_TYPES.security),
+              taskType: TASK_TYPES.security,
+              systemPrompt: effectiveSystemPrompt,
+              userContent: effectiveUserContent,
+              temperature: 0.1,
+              maxTokens: 1400,
+              fallbackTokens: [1200, 1000, 800, 600]
+            });
+          }
           throw error;
         }
       }
-    } else if (provider === MODEL_PROVIDERS.groq) {
-      raw = await groqGenerateJsonWithFallback({
-        model: selection.preferred,
-        profile: 'security',
-        taskType: TASK_TYPES.security,
-        allowModelFallback: !hasExplicitModel,
-        systemPrompt: SECURITY_MASTER_PROMPT,
-        userContent: JSON.stringify(context),
-        temperature: 0.1,
-        maxTokens: 800,
-        fallbackTokens: [600, 500, 400, 300, 200]
-      });
-    } else {
-      raw = await openRouterGenerateJsonWithFallback({
+
+      if (provider === MODEL_PROVIDERS.groq) {
+        return await groqGenerateJsonWithFallback({
+          model: selection.preferred,
+          profile: 'security',
+          taskType: TASK_TYPES.security,
+          allowModelFallback: !hasExplicitModel,
+          systemPrompt: effectiveSystemPrompt,
+          userContent: effectiveUserContent,
+          temperature: 0.1,
+          maxTokens: 800,
+          fallbackTokens: [600, 500, 400, 300, 200]
+        });
+      }
+
+      return await openRouterGenerateJsonWithFallback({
         model: selection.preferred,
         modelCandidates: selection.candidates,
         taskType: TASK_TYPES.security,
-        systemPrompt: SECURITY_MASTER_PROMPT,
-        userContent: JSON.stringify(context),
+        systemPrompt: effectiveSystemPrompt,
+        userContent: effectiveUserContent,
         temperature: 0.1,
         maxTokens: 1400,
         fallbackTokens: [1200, 1000, 800, 600]
       });
-    }
+    };
 
-    const payload = parseSecurityPayload(raw);
-    return res.json(payload);
+    const initialRaw = await runSecurityGeneration({});
+    const repaired = await parseWithRepairLoop({
+      initialRaw,
+      parseFn: parseSecurityPayload,
+      buildRepairInput: ({ error, raw, attempt }) => {
+        const repairSystemPrompt = `${SECURITY_MASTER_PROMPT}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON with fields: message, threat_level, findings[], actions[].`;
+        const repairUserContent = JSON.stringify({
+          task: 'repair_security_output',
+          attempt,
+          validation_error: error.message,
+          original_output: String(raw || '').slice(0, 12000)
+        });
+        return { repairSystemPrompt, repairUserContent };
+      },
+      runRepair: async ({ repairSystemPrompt, repairUserContent }) => runSecurityGeneration({
+        systemPromptOverride: repairSystemPrompt,
+        userContentOverride: repairUserContent
+      }),
+      maxAttempts: 3
+    });
+
+    return res.json({
+      ...repaired.payload,
+      diagnostics: {
+        ...repaired.diagnostics,
+        engine: 'security',
+        provider,
+        model: selection.preferred
+      }
+    });
   } catch (error) {
     const status = Number(error.status || 500);
     return res.status(status).json({ error: error.message || 'Failed to process security agent request.' });
@@ -1493,6 +2044,7 @@ app.post('/api/request', async (req, res) => {
     const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
     const headers = req.body?.headers && typeof req.body.headers === 'object' ? req.body.headers : {};
     const body = typeof req.body?.body === 'string' ? req.body.body : '';
+    const confirmMutation = req.body?.confirm_mutation === true;
 
     const allowedMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
     if (!allowedMethods.includes(method)) {
@@ -1514,11 +2066,13 @@ app.post('/api/request', async (req, res) => {
       return res.status(400).json({ error: 'Only http/https URLs are allowed.' });
     }
 
-    const forwardHeaders = { ...headers };
-    delete forwardHeaders.host;
-    delete forwardHeaders.Host;
-    delete forwardHeaders['content-length'];
-    delete forwardHeaders['Content-Length'];
+    await assertUrlAllowed(parsedUrl);
+
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && !confirmMutation) {
+      return res.status(400).json({ error: 'Mutation requests require explicit confirmation.' });
+    }
+
+    const forwardHeaders = sanitizeOutboundHeaders(headers);
 
     const outbound = {
       method,
@@ -1562,6 +2116,22 @@ app.get('/api/health', (_req, res) => {
       openrouter: Boolean(OPENROUTER_API_KEY),
       gemini: Boolean(GEMINI_API_KEY),
       groq: Boolean(GROQ_API_KEY)
+    }
+  });
+});
+
+app.get('/api/config', (_req, res) => {
+  res.json({
+    providers: MODEL_PROVIDERS,
+    models: {
+      openrouter: OPENROUTER_MODELS,
+      gemini: GEMINI_MODELS,
+      groq: GROQ_MODELS,
+      groq_options: GROQ_MODEL_ORDER
+    },
+    outbound_policy: {
+      blocks_auth_headers: true,
+      mutation_confirmation_required: true
     }
   });
 });

@@ -1,19 +1,19 @@
-const OPENROUTER_MODELS = {
+let OPENROUTER_MODELS = {
   default: 'openrouter/auto',
   advanced: 'openai/gpt-4o-mini',
   security: 'openai/gpt-4o'
 };
-const GEMINI_MODELS = {
-  default: 'gemini-1.5-flash',
-  advanced: 'gemini-1.5-flash',
-  security: 'gemini-1.5-flash'
+let GEMINI_MODELS = {
+  default: 'gemini-flash-latest',
+  advanced: 'gemini-flash-latest',
+  security: 'gemini-flash-latest'
 };
-const GROQ_MODELS = {
+let GROQ_MODELS = {
   default: 'groq/gpt-oss-120b',
   advanced: 'groq/gpt-oss-120b',
   security: 'groq/gpt-oss-safeguard-20b'
 };
-const GROQ_MODEL_OPTIONS = [
+let GROQ_MODEL_OPTIONS = [
   'groq/compound',
   'groq/compound-mini',
   'groq/gpt-oss-120b',
@@ -30,7 +30,8 @@ const BACKEND_ENDPOINTS = {
   agent: '/api/agent',
   assertions: '/api/assertions',
   request: '/api/request',
-  securityAgent: '/api/security-agent'
+  securityAgent: '/api/security-agent',
+  config: '/api/config'
 };
 
 const AGENT_WELCOME_HTML = `
@@ -63,6 +64,7 @@ let securityTestHistory = [];
 let securityThreatLevel = 'none';
 let activeSidebarWindow = 'requests';
 let errorLogEntries = [];
+let structuredDiagnosticsEntries = [];
 let scanPaceSetting = '0';
 let adaptiveScanPacingMs = 2000;
 const scanProgressState = {
@@ -120,7 +122,7 @@ function loadModelPreferences() {
     }
 
     const storedSidebarWindow = localStorage.getItem(STORAGE_KEYS.sidebarWindow);
-    if (storedSidebarWindow === 'requests' || storedSidebarWindow === 'errors') {
+    if (storedSidebarWindow === 'requests' || storedSidebarWindow === 'errors' || storedSidebarWindow === 'diagnostics') {
       activeSidebarWindow = storedSidebarWindow;
     }
 
@@ -143,6 +145,37 @@ function saveModelPreferences() {
     localStorage.setItem(STORAGE_KEYS.scanPaceMs, scanPaceSetting === 'adaptive' ? String(adaptiveScanPacingMs) : scanPaceSetting);
     localStorage.setItem(STORAGE_KEYS.scanPaceSetting, scanPaceSetting);
   } catch {}
+}
+
+async function loadRuntimeConfig() {
+  try {
+    const res = await fetch(BACKEND_ENDPOINTS.config);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data?.models?.openrouter && typeof data.models.openrouter === 'object') {
+      OPENROUTER_MODELS = { ...OPENROUTER_MODELS, ...data.models.openrouter };
+    }
+    if (data?.models?.gemini && typeof data.models.gemini === 'object') {
+      GEMINI_MODELS = { ...GEMINI_MODELS, ...data.models.gemini };
+    }
+    if (data?.models?.groq && typeof data.models.groq === 'object') {
+      GROQ_MODELS = { ...GROQ_MODELS, ...data.models.groq };
+    }
+    if (Array.isArray(data?.models?.groq_options) && data.models.groq_options.length) {
+      GROQ_MODEL_OPTIONS = data.models.groq_options.slice();
+    }
+    renderModelProviderOptions();
+  } catch (error) {
+    logError('config', `Failed to load runtime config: ${error.message}`);
+  }
+}
+
+function renderModelProviderOptions() {
+  const groqSelectEl = document.getElementById('groq-model-select');
+  if (!groqSelectEl) return;
+  groqSelectEl.innerHTML = GROQ_MODEL_OPTIONS
+    .map(modelId => `<option value="${escHtml(modelId)}">${escHtml(modelId)}</option>`)
+    .join('');
 }
 
 function getCurrentScanPacingMs() {
@@ -198,6 +231,10 @@ function renderSidebar() {
     renderErrorSidebar();
     return;
   }
+  if (activeSidebarWindow === 'diagnostics') {
+    renderDiagnosticsSidebar();
+    return;
+  }
   const list = document.getElementById('sidebar-list');
   if (!list) return;
   list.innerHTML = requests.map(r => `
@@ -218,6 +255,8 @@ function renderSidebarWindowNav() {
 
   const badge = document.getElementById('errors-count-badge');
   if (badge) badge.textContent = String(errorLogEntries.length);
+  const diagBadge = document.getElementById('diagnostics-count-badge');
+  if (diagBadge) diagBadge.textContent = String(structuredDiagnosticsEntries.length);
 }
 
 function renderSidebarHeader() {
@@ -225,14 +264,53 @@ function renderSidebarHeader() {
   const actionBtn = document.getElementById('new-req-btn');
   const clearErrorsBtn = document.getElementById('clear-errors-btn');
   if (title) {
-    title.textContent = activeSidebarWindow === 'errors' ? 'Errors' : 'Requests';
+    title.textContent = activeSidebarWindow === 'errors'
+      ? 'Errors'
+      : activeSidebarWindow === 'diagnostics'
+        ? 'Diagnostics'
+        : 'Requests';
   }
   if (actionBtn) {
-    actionBtn.style.display = activeSidebarWindow === 'errors' ? 'none' : 'flex';
+    actionBtn.style.display = activeSidebarWindow === 'requests' ? 'flex' : 'none';
   }
   if (clearErrorsBtn) {
     clearErrorsBtn.style.display = activeSidebarWindow === 'errors' ? 'flex' : 'none';
   }
+}
+
+function renderDiagnosticsSidebar() {
+  const list = document.getElementById('sidebar-list');
+  if (!list) return;
+  if (!structuredDiagnosticsEntries.length) {
+    list.innerHTML = `<div class="error-empty">No structured-output diagnostics yet.</div>`;
+    return;
+  }
+
+  list.innerHTML = structuredDiagnosticsEntries
+    .slice()
+    .reverse()
+    .map(entry => {
+      const statusLabel = entry.repaired ? 'repaired' : entry.status || 'valid';
+      const errorSummary = Array.isArray(entry.errors) && entry.errors.length
+        ? `Last error: ${escHtml(entry.errors[entry.errors.length - 1].message || '')}`
+        : 'No validation errors.';
+      return `
+        <div class="diag-item">
+          <div class="diag-item-header">
+            <span class="diag-item-source">${escHtml(entry.engine || entry.source || 'engine')}</span>
+            <span class="diag-item-time">${escHtml(entry.time || '')}</span>
+          </div>
+          <div class="diag-item-body">${errorSummary}</div>
+          <div class="diag-chip-row">
+            <span class="diag-chip">status: ${escHtml(statusLabel)}</span>
+            <span class="diag-chip">attempts: ${escHtml(String(entry.attempts || 0))}</span>
+            <span class="diag-chip">repairs: ${escHtml(String(entry.repairCount || 0))}</span>
+            <span class="diag-chip">${escHtml(entry.provider || '')}/${escHtml(entry.model || '')}</span>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
 }
 
 function renderErrorSidebar() {
@@ -259,7 +337,7 @@ function renderErrorSidebar() {
 }
 
 function setSidebarWindow(windowName) {
-  if (windowName !== 'requests' && windowName !== 'errors') return;
+  if (windowName !== 'requests' && windowName !== 'errors' && windowName !== 'diagnostics') return;
   activeSidebarWindow = windowName;
   try {
     localStorage.setItem(STORAGE_KEYS.sidebarWindow, windowName);
@@ -271,6 +349,29 @@ function clearErrorLogs() {
   errorLogEntries = [];
   renderSidebar();
   addAgentMsg('system', 'Cleared error log entries.', [], { track: false });
+}
+
+function logStructuredDiagnostics(sourcePath, diagnostics) {
+  if (!diagnostics || typeof diagnostics !== 'object') return;
+  structuredDiagnosticsEntries.push({
+    source: sourcePath,
+    engine: typeof diagnostics.engine === 'string' ? diagnostics.engine : 'unknown',
+    provider: typeof diagnostics.provider === 'string' ? diagnostics.provider : '',
+    model: typeof diagnostics.model === 'string' ? diagnostics.model : '',
+    attempts: Number(diagnostics.attempts || 0),
+    repairCount: Number(diagnostics.repairCount || 0),
+    repaired: Boolean(diagnostics.repaired),
+    status: typeof diagnostics.status === 'string' ? diagnostics.status : 'unknown',
+    errors: Array.isArray(diagnostics.errors) ? diagnostics.errors : [],
+    time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  });
+  if (structuredDiagnosticsEntries.length > 200) {
+    structuredDiagnosticsEntries = structuredDiagnosticsEntries.slice(-200);
+  }
+  renderSidebarWindowNav();
+  if (activeSidebarWindow === 'diagnostics') {
+    renderDiagnosticsSidebar();
+  }
 }
 
 function logError(source, message) {
@@ -350,6 +451,47 @@ function addKVRow(tbodyId, k = '', v = '') {
 }
 
 function escHtml(s) { return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function sanitizeRichText(html) {
+  const template = document.createElement('template');
+  template.innerHTML = String(html || '');
+
+  const allowedTags = new Set(['BR', 'EM', 'STRONG', 'CODE']);
+
+  function sanitizeNode(node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return document.createTextNode(node.textContent || '');
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return document.createDocumentFragment();
+    }
+
+    const tag = node.tagName.toUpperCase();
+    if (!allowedTags.has(tag)) {
+      const fragment = document.createDocumentFragment();
+      Array.from(node.childNodes).forEach(child => {
+        fragment.appendChild(sanitizeNode(child));
+      });
+      return fragment;
+    }
+
+    const clean = document.createElement(tag.toLowerCase());
+    Array.from(node.childNodes).forEach(child => {
+      clean.appendChild(sanitizeNode(child));
+    });
+    return clean;
+  }
+
+  const fragment = document.createDocumentFragment();
+  Array.from(template.content.childNodes).forEach(child => {
+    fragment.appendChild(sanitizeNode(child));
+  });
+  return fragment;
+}
+
+function setBubbleContent(element, text) {
+  element.replaceChildren(sanitizeRichText(text));
+}
 
 function normalizeConversationText(text) {
   return String(text || '')
@@ -477,8 +619,14 @@ function requestStopAgentRun() {
 function renderWelcomeMessage() {
   const el = document.getElementById('agent-messages');
   if (!el) return;
-  el.innerHTML = AGENT_WELCOME_HTML;
-  el.scrollTop = el.scrollHeight;
+  el.innerHTML = '';
+  addAgentMsg('agent', `
+      Hi! I can help you build API requests from plain English. Try something like:<br><br>
+      <em>"GET all users from JSONPlaceholder"</em><br>
+      <em>"POST a new todo with a random title"</em><br>
+      <em>"Chain: get user 1, then fetch their posts"</em><br><br>
+      I can also auto-debug errors and generate test assertions.
+    `, [], { track: false });
 }
 
 function startNewChat() {
@@ -595,11 +743,26 @@ document.querySelectorAll('.tab').forEach(t => {
 // SEND
 document.getElementById('send-btn').addEventListener('click', sendRequest);
 
-async function sendRequest() {
+async function sendRequest(options = {}) {
+  let { confirmMutation = false } = options;
   saveActive();
   const r = getActive();
   const btn = document.getElementById('send-btn');
   btn.disabled = true; btn.textContent = 'Sending…';
+
+  const methodUpper = String(r.method || 'GET').toUpperCase();
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(methodUpper) && !confirmMutation) {
+    const proceed = window.confirm(
+      `${methodUpper} requests can modify remote state.\n\nURL: ${r.url || '(empty)'}\n\nContinue?`
+    );
+    if (!proceed) {
+      btn.disabled = false;
+      btn.textContent = 'Send';
+      addAgentMsg('system', `Cancelled ${methodUpper} request before execution.`, [], { track: false });
+      return null;
+    }
+    confirmMutation = true;
+  }
 
   let url = r.url.trim();
   const params = r.params.filter(p => p.k);
@@ -620,7 +783,8 @@ async function sendRequest() {
       method: r.method,
       url,
       headers: fetchOpts.headers,
-      body: fetchOpts.body || ''
+      body: fetchOpts.body || '',
+      confirm_mutation: confirmMutation
     });
 
     const elapsed = Number(data.elapsed_ms || 0);
@@ -941,7 +1105,7 @@ function readJsonPath(json, path) {
 }
 
 function canAutoRunProbe(action) {
-  return action.method === 'GET';
+  return false;
 }
 
 function requiresMutationConfirmation(method) {
@@ -972,7 +1136,9 @@ async function executeSecurityProbe(action, options = {}) {
   }
 
   applyProbeAction(action, { skipMessage: skipApplyMessage });
-  const response = await sendRequest();
+  const response = await sendRequest({
+    confirmMutation: !['GET', 'HEAD', 'OPTIONS'].includes(String(action.method || '').toUpperCase())
+  });
   appendSecurityHistory({
     method: action.method,
     url: action.url,
@@ -1085,7 +1251,11 @@ async function generateProbeForScanStep(scanPlan, planStep) {
   updateThreatLevel(parsed.threat_level);
   renderSecurityFindings(parsed.findings, securityThreatLevel);
 
-  const actions = (parsed.actions || []).map(normalizeSecurityAction).filter(Boolean);
+  const actionBatch = normalizeSecurityActionsStrict(parsed.actions || []);
+  if (actionBatch.invalidCount > 0) {
+    throw new Error(`Blocked malformed security action batch at indexes: ${actionBatch.invalidIndexes.join(', ')}`);
+  }
+  const actions = actionBatch.normalized;
   const probe = actions.find(action => action.type === 'probe');
   if (probe) return { probe, chain: null, message: parsed.message, assertions: actions.filter(a => a.type === 'set_assertions'), hadRateLimit };
   const chain = actions.find(action => action.type === 'probe_chain');
@@ -1208,6 +1378,317 @@ async function executeScanPlan(scanPlan) {
 }
 
 // ASSERTIONS
+function tokenizeAssertionExpression(input) {
+  const text = String(input || '');
+  const tokens = [];
+  let i = 0;
+  const multiCharOps = ['===', '!==', '>=', '<=', '&&', '||'];
+  const singleCharOps = new Set(['(', ')', '[', ']', '.', ',', '!', '>', '<']);
+
+  while (i < text.length) {
+    const ch = text[i];
+
+    if (/\s/.test(ch)) {
+      i += 1;
+      continue;
+    }
+
+    const op = multiCharOps.find(candidate => text.startsWith(candidate, i));
+    if (op) {
+      tokens.push({ type: 'op', value: op });
+      i += op.length;
+      continue;
+    }
+
+    if (singleCharOps.has(ch)) {
+      tokens.push({ type: 'op', value: ch });
+      i += 1;
+      continue;
+    }
+
+    if (ch === '"' || ch === '\'') {
+      const quote = ch;
+      let value = '';
+      i += 1;
+      while (i < text.length) {
+        const current = text[i];
+        if (current === '\\') {
+          if (text[i + 1]) value += text[i + 1];
+          i += 2;
+          continue;
+        }
+        if (current === quote) {
+          i += 1;
+          break;
+        }
+        value += current;
+        i += 1;
+      }
+      tokens.push({ type: 'string', value });
+      continue;
+    }
+
+    if (/[0-9]/.test(ch)) {
+      const start = i;
+      i += 1;
+      while (i < text.length && /[0-9.]/.test(text[i])) i += 1;
+      tokens.push({ type: 'number', value: Number(text.slice(start, i)) });
+      continue;
+    }
+
+    if (/[A-Za-z_$]/.test(ch)) {
+      const start = i;
+      i += 1;
+      while (i < text.length && /[A-Za-z0-9_$]/.test(text[i])) i += 1;
+      tokens.push({ type: 'identifier', value: text.slice(start, i) });
+      continue;
+    }
+
+    throw new Error(`Unsupported token: ${ch}`);
+  }
+
+  return tokens;
+}
+
+function parseAssertionExpression(input) {
+  const tokens = tokenizeAssertionExpression(input);
+  let index = 0;
+
+  function peek(offset = 0) {
+    return tokens[index + offset];
+  }
+
+  function consume(expected) {
+    const token = tokens[index];
+    if (!token || (expected && token.value !== expected)) {
+      throw new Error(`Expected ${expected || 'token'}.`);
+    }
+    index += 1;
+    return token;
+  }
+
+  function parsePrimary() {
+    const token = peek();
+    if (!token) throw new Error('Unexpected end of expression.');
+
+    if (token.type === 'number' || token.type === 'string') {
+      index += 1;
+      return { type: 'literal', value: token.value };
+    }
+
+    if (token.type === 'identifier') {
+      if (token.value === 'true' || token.value === 'false') {
+        index += 1;
+        return { type: 'literal', value: token.value === 'true' };
+      }
+      if (token.value === 'null') {
+        index += 1;
+        return { type: 'literal', value: null };
+      }
+      index += 1;
+      return { type: 'identifier', name: token.value };
+    }
+
+    if (token.value === '(') {
+      consume('(');
+      const expr = parseLogicalOr();
+      consume(')');
+      return expr;
+    }
+
+    throw new Error(`Unexpected token: ${token.value}`);
+  }
+
+  function parsePostfix() {
+    let expr = parsePrimary();
+
+    while (true) {
+      const token = peek();
+      if (!token) break;
+
+      if (token.value === '.') {
+        consume('.');
+        const property = consume();
+        if (property.type !== 'identifier') throw new Error('Expected property name.');
+        expr = {
+          type: 'member',
+          object: expr,
+          property: { type: 'literal', value: property.value },
+          computed: false
+        };
+        continue;
+      }
+
+      if (token.value === '[') {
+        consume('[');
+        const property = parseLogicalOr();
+        consume(']');
+        expr = { type: 'member', object: expr, property, computed: true };
+        continue;
+      }
+
+      if (token.value === '(') {
+        consume('(');
+        const args = [];
+        if (peek() && peek().value !== ')') {
+          while (true) {
+            args.push(parseLogicalOr());
+            if (!peek() || peek().value !== ',') break;
+            consume(',');
+          }
+        }
+        consume(')');
+        expr = { type: 'call', callee: expr, args };
+        continue;
+      }
+
+      break;
+    }
+
+    return expr;
+  }
+
+  function parseUnary() {
+    const token = peek();
+    if (token && token.type === 'identifier' && token.value === 'typeof') {
+      consume();
+      return { type: 'unary', operator: 'typeof', argument: parseUnary() };
+    }
+    if (token && token.value === '!') {
+      consume('!');
+      return { type: 'unary', operator: '!', argument: parseUnary() };
+    }
+    return parsePostfix();
+  }
+
+  function parseComparison() {
+    let expr = parseUnary();
+    while (peek() && ['>', '<', '>=', '<='].includes(peek().value)) {
+      const operator = consume().value;
+      expr = { type: 'binary', operator, left: expr, right: parseUnary() };
+    }
+    return expr;
+  }
+
+  function parseEquality() {
+    let expr = parseComparison();
+    while (peek() && ['===', '!=='].includes(peek().value)) {
+      const operator = consume().value;
+      expr = { type: 'binary', operator, left: expr, right: parseComparison() };
+    }
+    return expr;
+  }
+
+  function parseLogicalAnd() {
+    let expr = parseEquality();
+    while (peek() && peek().value === '&&') {
+      consume('&&');
+      expr = { type: 'logical', operator: '&&', left: expr, right: parseEquality() };
+    }
+    return expr;
+  }
+
+  function parseLogicalOr() {
+    let expr = parseLogicalAnd();
+    while (peek() && peek().value === '||') {
+      consume('||');
+      expr = { type: 'logical', operator: '||', left: expr, right: parseLogicalAnd() };
+    }
+    return expr;
+  }
+
+  const expression = parseLogicalOr();
+  if (index !== tokens.length) {
+    throw new Error(`Unexpected token: ${tokens[index].value}`);
+  }
+  return expression;
+}
+
+function evaluateAssertionAst(node, scope) {
+  if (node.type === 'literal') return node.value;
+
+  if (node.type === 'identifier') {
+    if (!Object.prototype.hasOwnProperty.call(scope, node.name)) {
+      throw new Error(`Identifier not allowed: ${node.name}`);
+    }
+    return scope[node.name];
+  }
+
+  if (node.type === 'unary') {
+    const value = evaluateAssertionAst(node.argument, scope);
+    if (node.operator === '!') return !value;
+    if (node.operator === 'typeof') return typeof value;
+    throw new Error(`Unary operator not allowed: ${node.operator}`);
+  }
+
+  if (node.type === 'member') {
+    const object = evaluateAssertionAst(node.object, scope);
+    const property = node.computed ? evaluateAssertionAst(node.property, scope) : node.property.value;
+    if (object == null) return undefined;
+    return object[property];
+  }
+
+  if (node.type === 'binary') {
+    const left = evaluateAssertionAst(node.left, scope);
+    const right = evaluateAssertionAst(node.right, scope);
+    switch (node.operator) {
+      case '===': return left === right;
+      case '!==': return left !== right;
+      case '>': return left > right;
+      case '<': return left < right;
+      case '>=': return left >= right;
+      case '<=': return left <= right;
+      default: throw new Error(`Binary operator not allowed: ${node.operator}`);
+    }
+  }
+
+  if (node.type === 'logical') {
+    if (node.operator === '&&') return evaluateAssertionAst(node.left, scope) && evaluateAssertionAst(node.right, scope);
+    if (node.operator === '||') return evaluateAssertionAst(node.left, scope) || evaluateAssertionAst(node.right, scope);
+    throw new Error(`Logical operator not allowed: ${node.operator}`);
+  }
+
+  if (node.type === 'call') {
+    if (
+      node.callee.type === 'member'
+      && node.callee.object.type === 'identifier'
+      && node.callee.object.name === 'Array'
+      && node.callee.property.value === 'isArray'
+    ) {
+      const args = node.args.map(arg => evaluateAssertionAst(arg, scope));
+      return Array.isArray(args[0]);
+    }
+
+    if (node.callee.type === 'member') {
+      const target = evaluateAssertionAst(node.callee.object, scope);
+      const property = node.callee.computed ? evaluateAssertionAst(node.callee.property, scope) : node.callee.property.value;
+      const args = node.args.map(arg => evaluateAssertionAst(arg, scope));
+
+      if (property === 'includes' && (typeof target === 'string' || Array.isArray(target))) {
+        return target.includes(args[0]);
+      }
+      if (property === 'startsWith' && typeof target === 'string') {
+        return target.startsWith(args[0]);
+      }
+      if (property === 'endsWith' && typeof target === 'string') {
+        return target.endsWith(args[0]);
+      }
+      if (property === 'hasOwnProperty' && target && typeof target === 'object') {
+        return Object.prototype.hasOwnProperty.call(target, args[0]);
+      }
+      throw new Error(`Method not allowed: ${property}`);
+    }
+
+    throw new Error('Function call not allowed.');
+  }
+
+  throw new Error(`Expression node not supported: ${node.type}`);
+}
+
+function evaluateAssertionExpression(expression, scope) {
+  return evaluateAssertionAst(parseAssertionExpression(expression), scope);
+}
+
 function renderAssertions(list) {
   const el = document.getElementById('assertions-list');
   const count = document.getElementById('assertion-count');
@@ -1230,8 +1711,12 @@ function runAssertions(assertions, resp) {
 
   assertions.forEach(a => {
     try {
-      const fn = new Function('status', 'body', 'json', `return (${a.expr})`);
-      const result = fn(resp.status, resp.text, parsed);
+      const result = evaluateAssertionExpression(a.expr, {
+        status: resp.status,
+        body: resp.text,
+        json: parsed,
+        Array
+      });
       a.status = result ? 'pass' : 'fail';
       if (!result) a.error = 'returned false';
     } catch(e) { a.status = 'fail'; a.error = e.message; }
@@ -1274,7 +1759,10 @@ async function autoSuggestAssertions() {
     renderAssertions(r.assertions);
     switchTab('assertions');
     addAgentMsg('system', `Generated ${arr.length} assertions. Check the Assertions tab to review and run them.`);
-  } catch {}
+  } catch (error) {
+    logError('assertions', `Automatic assertion generation failed: ${error.message}`);
+    addAgentMsg('system', `Automatic assertion generation failed: ${escHtml(error.message)}.`, [], { track: false });
+  }
 }
 
 function buildUserContext(req, resp, userMsg) {
@@ -1394,6 +1882,42 @@ function validateAndNormalizeAction(action) {
   return null;
 }
 
+function normalizeAgentActionsStrict(actions) {
+  const source = Array.isArray(actions) ? actions : [];
+  const normalized = [];
+  const invalidIndexes = [];
+
+  source.forEach((action, index) => {
+    const parsed = validateAndNormalizeAction(action);
+    if (!parsed) invalidIndexes.push(index);
+    else normalized.push(parsed);
+  });
+
+  return {
+    normalized,
+    invalidIndexes,
+    invalidCount: invalidIndexes.length
+  };
+}
+
+function normalizeSecurityActionsStrict(actions) {
+  const source = Array.isArray(actions) ? actions : [];
+  const normalized = [];
+  const invalidIndexes = [];
+
+  source.forEach((action, index) => {
+    const parsed = normalizeSecurityAction(action);
+    if (!parsed) invalidIndexes.push(index);
+    else normalized.push(parsed);
+  });
+
+  return {
+    normalized,
+    invalidIndexes,
+    invalidCount: invalidIndexes.length
+  };
+}
+
 // AGENT
 document.getElementById('agent-send-btn').addEventListener('click', askAgent);
 document.getElementById('agent-input').addEventListener('keydown', e => {
@@ -1406,7 +1930,14 @@ function addAgentMsg(role, text, chips = [], options = {}) {
   const roleLabels = { user: 'You', agent: 'Agent', system: 'System', error: 'Error' };
   const div = document.createElement('div');
   div.className = `msg ${role}`;
-  div.innerHTML = `<div class="msg-role">${roleLabels[role] || role}</div><div class="msg-bubble">${text}</div>`;
+  const roleEl = document.createElement('div');
+  roleEl.className = 'msg-role';
+  roleEl.textContent = roleLabels[role] || role;
+  const bubbleEl = document.createElement('div');
+  bubbleEl.className = 'msg-bubble';
+  setBubbleContent(bubbleEl, text);
+  div.appendChild(roleEl);
+  div.appendChild(bubbleEl);
   if (chips.length) {
     const chipRow = document.createElement('div');
     chipRow.style.display = 'flex'; chipRow.style.flexWrap = 'wrap'; chipRow.style.gap = '6px'; chipRow.style.paddingLeft = '0';
@@ -1517,7 +2048,12 @@ async function runSecurityAgent(initialUserMsg) {
     }
 
     const parsed = parseSecurityPayload(raw);
-    const normalizedActions = (parsed.actions || []).map(normalizeSecurityAction).filter(Boolean);
+    const actionBatch = normalizeSecurityActionsStrict(parsed.actions || []);
+    if (actionBatch.invalidCount > 0) {
+      addAgentMsg('error', `Blocked malformed security action batch at indexes: ${actionBatch.invalidIndexes.join(', ')}.`);
+      break;
+    }
+    const normalizedActions = actionBatch.normalized;
     const chips = [];
     let didAutoSend = false;
 
@@ -1692,9 +2228,12 @@ async function askAgent() {
       const chips = [];
       let didAutoSend = false;
 
-      const normalizedActions = (parsed.actions || [])
-        .map(validateAndNormalizeAction)
-        .filter(Boolean);
+      const actionBatch = normalizeAgentActionsStrict(parsed.actions || []);
+      if (actionBatch.invalidCount > 0) {
+        addAgentMsg('error', `Blocked malformed agent action batch at indexes: ${actionBatch.invalidIndexes.join(', ')}.`);
+        break;
+      }
+      const normalizedActions = actionBatch.normalized;
 
       if (agentMode === 'agent') {
         const setRequestAction = normalizedActions.find(action => action.type === 'set_request');
@@ -1709,9 +2248,18 @@ async function askAgent() {
             normalizedActions
               .filter(action => action.type === 'set_assertions')
               .forEach(action => applyAssertions(action.assertions, { skipMessage: true }));
-            addAgentMsg('system', `Auto-sending request generated by the agent (step ${step + 1}).`);
-            await sendRequest();
-            didAutoSend = true;
+            if (['GET', 'HEAD', 'OPTIONS'].includes(setRequestAction.method)) {
+              addAgentMsg('system', `Auto-sending request generated by the agent (step ${step + 1}).`);
+              await sendRequest();
+              didAutoSend = true;
+            } else {
+              chips.push({
+                label: `Review before sending ${setRequestAction.method}`,
+                cls: 'apply',
+                fn: () => sendRequest({ confirmMutation: true })
+              });
+              addAgentMsg('system', `Agent generated a mutating request (${setRequestAction.method}). Review it before sending.`, [], { track: false });
+            }
           }
         }
       }
@@ -1843,6 +2391,9 @@ async function callBackendJson(path, payload, options = {}) {
   if (!res.ok) {
     throw new Error(data?.error || data?.message || `Backend request failed (${res.status}).`);
   }
+  if (data?.diagnostics) {
+    logStructuredDiagnostics(path, data.diagnostics);
+  }
   return data;
 }
 
@@ -1901,11 +2452,14 @@ const origSendRequest = sendRequest;
 })();
 
 // Init
-loadModelPreferences();
-loadActive();
-renderSidebar();
-renderModelProvider();
-renderScanPaceControl();
-renderAgentMode();
-syncAgentRunControls();
-renderScanProgress();
+(async function initApp() {
+  loadModelPreferences();
+  await loadRuntimeConfig();
+  loadActive();
+  renderSidebar();
+  renderModelProvider();
+  renderScanPaceControl();
+  renderAgentMode();
+  syncAgentRunControls();
+  renderScanProgress();
+})();

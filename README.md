@@ -45,7 +45,9 @@ cp .env.example .env
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 GEMINI_API_KEY=your_gemini_api_key_here
 GROQ_API_KEY=your_groq_api_key_here
-OPENROUTER_SECURITY_MODEL=openai/gpt-4o
+OPENROUTER_DEFAULT_MODEL=qwen/qwen3.6-plus:free
+OPENROUTER_ADVANCED_MODEL=qwen/qwen3.6-plus:free
+OPENROUTER_SECURITY_MODEL=qwen/qwen3.6-plus:free
 PORT=3000
 ```
 
@@ -86,7 +88,9 @@ npm start
 ```env
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 GEMINI_API_KEY=your_gemini_api_key_here
-OPENROUTER_SECURITY_MODEL=openai/gpt-4o
+OPENROUTER_DEFAULT_MODEL=qwen/qwen3.6-plus:free
+OPENROUTER_ADVANCED_MODEL=qwen/qwen3.6-plus:free
+OPENROUTER_SECURITY_MODEL=qwen/qwen3.6-plus:free
 ```
 
 1. Deploy.

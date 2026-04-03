@@ -12,6 +12,7 @@ const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const OPENROUTER_QWEN_DEFAULT_MODEL = process.env.OPENROUTER_DEFAULT_MODEL || 'qwen/qwen3.6-plus:free';
 
 const MODEL_PROVIDERS = {
   openrouter: 'openrouter',
@@ -20,9 +21,16 @@ const MODEL_PROVIDERS = {
 };
 
 const OPENROUTER_MODELS = {
-  default: 'openrouter/auto',
-  advanced: 'openai/gpt-4o-mini',
-  security: process.env.OPENROUTER_SECURITY_MODEL || 'openai/gpt-4o'
+  default: OPENROUTER_QWEN_DEFAULT_MODEL,
+  advanced: process.env.OPENROUTER_ADVANCED_MODEL || OPENROUTER_QWEN_DEFAULT_MODEL,
+  security: process.env.OPENROUTER_SECURITY_MODEL || OPENROUTER_QWEN_DEFAULT_MODEL
+};
+const OPENROUTER_MODEL_ALIASES = {
+  'openrouter/auto': OPENROUTER_QWEN_DEFAULT_MODEL,
+  'qwen/qwen3.6-plus': OPENROUTER_QWEN_DEFAULT_MODEL,
+  'qwen3.6-plus': OPENROUTER_QWEN_DEFAULT_MODEL,
+  'qwen 3.6 plus': OPENROUTER_QWEN_DEFAULT_MODEL,
+  'qwen 3.6 plus free': OPENROUTER_QWEN_DEFAULT_MODEL
 };
 
 const GEMINI_MODELS = {
@@ -690,7 +698,11 @@ function assertApiKeyConfigured(provider) {
 }
 
 function parseOpenRouterModel(model) {
-  if (typeof model === 'string' && model.trim()) return model.trim();
+  if (typeof model === 'string' && model.trim()) {
+    const normalized = model.trim();
+    const aliasKey = normalized.toLowerCase();
+    return OPENROUTER_MODEL_ALIASES[aliasKey] || OPENROUTER_MODEL_ALIASES[normalized] || normalized;
+  }
   return OPENROUTER_MODELS.default;
 }
 

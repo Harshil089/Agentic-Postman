@@ -1,7 +1,8 @@
+const OPENROUTER_QWEN_DEFAULT_MODEL = 'qwen/qwen3.6-plus:free';
 let OPENROUTER_MODELS = {
-  default: 'openrouter/auto',
-  advanced: 'openai/gpt-4o-mini',
-  security: 'openai/gpt-4o'
+  default: OPENROUTER_QWEN_DEFAULT_MODEL,
+  advanced: OPENROUTER_QWEN_DEFAULT_MODEL,
+  security: OPENROUTER_QWEN_DEFAULT_MODEL
 };
 let GEMINI_MODELS = {
   default: 'gemini-2.5-flash',

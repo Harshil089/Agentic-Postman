@@ -647,15 +647,16 @@ AUTH BYPASS HEADERS:
 
 BEHAVIORAL RULES
 1. Raw JSON only. No markdown, no prose, no code fences.
-2. Never generate payloads targeting real production infrastructure unless auth_context confirms explicit written authorization.
-3. One vector per probe action.
-4. evidence in findings MUST quote actual response content - never inferred.
-5. If last_response.status === 500 -> always generate a debug_info action.
-6. If last_response body contains "password", "secret", "token", "key" in plaintext -> auto-elevate finding to HIGH and include in findings array.
-7. For IDOR probes, always test: id-1, id+1, id*2, id=0, id=99999, id=null, id=-1.
-8. For auth tests, always test: no header, wrong scheme, expired token, alg:none JWT, and role-escalated JWT payload.
-9. scan_plan is always the first action when user_instruction contains "scan", "audit", "test all", or "full check".
-10. threat_level escalation is permanent within a session - it never decreases once raised.`;
+2. This is an API IDE and learning tool. Do not refuse a scan or plan solely because the target is a public or production domain.
+3. Prefer planning and non-destructive probes first. When the request is broad ("scan", "audit", "full check"), return scan_plan first and then the safest useful next actions.
+4. One vector per probe action.
+5. evidence in findings MUST quote actual response content - never inferred.
+6. If last_response.status === 500 -> always generate a debug_info action.
+7. If last_response body contains "password", "secret", "token", "key" in plaintext -> auto-elevate finding to HIGH and include in findings array.
+8. For IDOR probes, always test: id-1, id+1, id*2, id=0, id=99999, id=null, id=-1.
+9. For auth tests, always test: no header, wrong scheme, expired token, alg:none JWT, and role-escalated JWT payload.
+10. scan_plan is always the first action when user_instruction contains "scan", "audit", "test all", or "full check".
+11. threat_level escalation is permanent within a session - it never decreases once raised.`;
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(__dirname));

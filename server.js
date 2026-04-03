@@ -55,7 +55,7 @@ const GROQ_MODEL_ALIASES = {
 const GROQ_MODELS = {
   default: 'groq/gpt-oss-120b',
   advanced: 'groq/gpt-oss-120b',
-  security: 'groq/gpt-oss-safeguard-20b'
+  security: 'groq/gpt-oss-120b'
 };
 
 const GROQ_MODEL_ORDER = [
@@ -1176,8 +1176,11 @@ function isGroqTokenBudgetError(error) {
 }
 
 function isGroqRetryableModelError(error) {
+  const status = Number(error?.status || 0);
   const msg = String(error?.message || '').toLowerCase();
-  return msg.includes('decommissioned')
+  return status === 413
+    || msg.includes('request entity too large')
+    || msg.includes('decommissioned')
     || msg.includes('not found')
     || msg.includes('blocked at the project level')
     || msg.includes('failed to validate json')
@@ -1207,6 +1210,64 @@ function getGroqRetryDelayMs(error) {
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function truncateText(value, maxLength) {
+  const text = typeof value === 'string' ? value : value == null ? '' : String(value);
+  if (!Number.isFinite(maxLength) || maxLength <= 0) return '';
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1))}...`;
+}
+
+function compactHeaderLikeList(list, maxItems = 8, maxValueLength = 120) {
+  const source = Array.isArray(list) ? list : [];
+  return source
+    .slice(0, maxItems)
+    .map(item => ({
+      k: truncateText(item?.k, 40),
+      v: truncateText(item?.v, maxValueLength)
+    }))
+    .filter(item => item.k);
+}
+
+function compactSecurityContext(context, provider) {
+  const isGroq = provider === MODEL_PROVIDERS.groq;
+  const currentRequest = context?.current_request && typeof context.current_request === 'object'
+    ? context.current_request
+    : {};
+  const lastResponse = context?.last_response && typeof context.last_response === 'object'
+    ? context.last_response
+    : null;
+  const testHistory = Array.isArray(context?.test_history) ? context.test_history : [];
+
+  return {
+    target_url: truncateText(context?.target_url, 240),
+    current_request: {
+      method: truncateText(currentRequest.method, 12),
+      url: truncateText(currentRequest.url, 320),
+      headers: compactHeaderLikeList(currentRequest.headers, isGroq ? 6 : 10, isGroq ? 80 : 140),
+      params: compactHeaderLikeList(currentRequest.params, isGroq ? 6 : 10, isGroq ? 80 : 140),
+      body: truncateText(currentRequest.body, isGroq ? 400 : 1200)
+    },
+    last_response: lastResponse ? {
+      status: Number(lastResponse.status || 0),
+      elapsed_ms: Number(lastResponse.elapsed_ms || 0),
+      body_preview: truncateText(lastResponse.body_preview, isGroq ? 450 : 1200)
+    } : null,
+    auth_context: context?.auth_context && typeof context.auth_context === 'object'
+      ? {
+          type: truncateText(context.auth_context.type, 20),
+          value: truncateText(context.auth_context.value, isGroq ? 80 : 140)
+        }
+      : null,
+    test_history: testHistory.slice(isGroq ? -6 : -12).map(entry => ({
+      method: truncateText(entry?.method, 12),
+      url: truncateText(entry?.url, 220),
+      status: Number(entry?.status || 0),
+      finding: truncateText(entry?.finding, isGroq ? 90 : 180)
+    })),
+    user_instruction: truncateText(context?.user_instruction, isGroq ? 320 : 1200)
+  };
 }
 
 async function groqGenerateJsonWithFallback({
@@ -2035,7 +2096,7 @@ app.post('/api/security-agent', async (req, res) => {
       return res.status(400).json({ error: 'Missing security context object.' });
     }
 
-    const securityUserContent = JSON.stringify(context);
+    const securityUserContent = JSON.stringify(compactSecurityContext(context, provider));
     const runSecurityGeneration = async ({ systemPromptOverride, userContentOverride }) => {
       const effectiveSystemPrompt = systemPromptOverride || SECURITY_MASTER_PROMPT;
       const effectiveUserContent = userContentOverride || securityUserContent;

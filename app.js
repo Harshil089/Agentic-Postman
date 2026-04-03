@@ -11,7 +11,7 @@ let GEMINI_MODELS = {
 let GROQ_MODELS = {
   default: 'groq/gpt-oss-120b',
   advanced: 'groq/gpt-oss-120b',
-  security: 'groq/gpt-oss-safeguard-20b'
+  security: 'groq/gpt-oss-120b'
 };
 let GROQ_MODEL_OPTIONS = [
   'groq/compound',
@@ -808,7 +808,7 @@ document.querySelectorAll('.tab').forEach(t => {
 document.getElementById('send-btn').addEventListener('click', sendRequest);
 
 async function sendRequest(options = {}) {
-  let { confirmMutation = false } = options;
+  let { confirmMutation = false, skipAutoAssertions = false } = options;
   saveActive();
   const r = getActive();
   const btn = document.getElementById('send-btn');
@@ -864,7 +864,7 @@ async function sendRequest(options = {}) {
     document.getElementById('response-body').textContent = formatted;
 
     runAssertions(r.assertions, lastResponse);
-    if (r.assertions.length === 0) autoSuggestAssertions();
+    if (r.assertions.length === 0 && !skipAutoAssertions) autoSuggestAssertions();
     return lastResponse;
   } catch (e) {
     lastResponse = { error: e.message };
@@ -952,6 +952,21 @@ function deriveAuthContext(headers) {
     return { type: 'apikey', value: map.get('api-key') || '' };
   }
   return { type: 'none', value: '' };
+}
+
+function getSecurityProviderFallbackOrder(preferredProvider) {
+  const order = [preferredProvider, MODEL_PROVIDERS.openrouter, MODEL_PROVIDERS.groq, MODEL_PROVIDERS.gemini];
+  return order.filter((provider, index) => provider && order.indexOf(provider) === index);
+}
+
+function getProviderModel(provider, taskType = 'security') {
+  if (provider === MODEL_PROVIDERS.gemini) {
+    return taskType === 'security' ? GEMINI_MODELS.security : GEMINI_MODELS.default;
+  }
+  if (provider === MODEL_PROVIDERS.groq) {
+    return selectedGroqModel;
+  }
+  return taskType === 'security' ? OPENROUTER_MODELS.security : OPENROUTER_MODELS.default;
 }
 
 function buildSecurityContext(req, resp, userMsg) {
@@ -1201,7 +1216,8 @@ async function executeSecurityProbe(action, options = {}) {
 
   applyProbeAction(action, { skipMessage: skipApplyMessage });
   const response = await sendRequest({
-    confirmMutation: !['GET', 'HEAD', 'OPTIONS'].includes(String(action.method || '').toUpperCase())
+    confirmMutation: !['GET', 'HEAD', 'OPTIONS'].includes(String(action.method || '').toUpperCase()),
+    skipAutoAssertions: true
   });
   appendSecurityHistory({
     method: action.method,
@@ -1281,29 +1297,47 @@ async function generateProbeForScanStep(scanPlan, planStep) {
   let raw;
   let lastRateError = null;
   let hadRateLimit = false;
-  const maxAttempts = 3;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      raw = await callSecurityAgent(
-        context.target_url,
-        context.current_request,
-        context.last_response,
-        context.auth_context,
-        context.test_history,
-        context.user_instruction
-      );
-      break;
-    } catch (error) {
-      const message = error?.message || 'Unknown error';
-      if (!isRateLimitErrorMessage(message) || attempt >= maxAttempts) {
-        throw error;
+  const providersToTry = getSecurityProviderFallbackOrder(selectedModelProvider);
+
+  providerLoop:
+  for (const provider of providersToTry) {
+    const maxAttempts = provider === selectedModelProvider ? 2 : 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        raw = await callSecurityAgent(
+          context.target_url,
+          context.current_request,
+          context.last_response,
+          context.auth_context,
+          context.test_history,
+          context.user_instruction,
+          {
+            providerOverride: provider,
+            modelOverride: getProviderModel(provider, 'security')
+          }
+        );
+        break providerLoop;
+      } catch (error) {
+        const message = error?.message || 'Unknown error';
+        if (!isRateLimitErrorMessage(message)) {
+          throw error;
+        }
+        lastRateError = error;
+        hadRateLimit = true;
+        const delayMs = Math.min(getRetryDelayMs(message), 4000);
+        bumpAdaptiveScanPacing(delayMs);
+
+        if (attempt < maxAttempts) {
+          addAgentMsg('system', `Rate limit detected while generating probe for step ${planStep.order || '?'} with ${provider}. Retrying in ${Math.ceil(delayMs / 1000)}s...`, [], { track: false });
+          await waitMs(delayMs);
+          continue;
+        }
+
+        if (provider !== providersToTry[providersToTry.length - 1]) {
+          addAgentMsg('system', `Rate limit detected while generating probe for step ${planStep.order || '?'} with ${provider}. Falling back to the next provider.`, [], { track: false });
+          continue providerLoop;
+        }
       }
-      lastRateError = error;
-      const delayMs = getRetryDelayMs(message);
-      hadRateLimit = true;
-      bumpAdaptiveScanPacing(delayMs);
-      addAgentMsg('system', `Rate limit detected while generating probe for step ${planStep.order || '?'}. Retrying in ${Math.ceil(delayMs / 1000)}s...`, [], { track: false });
-      await waitMs(delayMs);
     }
   }
 
@@ -1808,13 +1842,19 @@ async function autoSuggestAssertions() {
   if (!lastResponse) return;
   const preview = lastResponse.text?.substring(0, 600);
   try {
+    const preferredProvider = selectedModelProvider === MODEL_PROVIDERS.gemini
+      ? MODEL_PROVIDERS.openrouter
+      : selectedModelProvider;
+    const preferredModel = preferredProvider === MODEL_PROVIDERS.groq
+      ? selectedGroqModel
+      : preferredProvider === MODEL_PROVIDERS.gemini
+        ? GEMINI_MODELS.default
+        : OPENROUTER_MODELS.default;
     const parsed = await callBackendJson(BACKEND_ENDPOINTS.assertions, {
       status: lastResponse.status,
       body_preview: preview,
-      provider: selectedModelProvider,
-      model: selectedModelProvider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.default :
-              selectedModelProvider === MODEL_PROVIDERS.groq ? selectedGroqModel :
-             OPENROUTER_MODELS.default
+      provider: preferredProvider,
+      model: preferredModel
     });
     const arr = Array.isArray(parsed?.assertions) ? parsed.assertions : [];
     if (!arr.length) return;
@@ -2474,10 +2514,12 @@ function shortenUrl(url) {
 }
 
 async function callSecurityAgent(targetUrl, currentRequest, lastResponseData, authContext, testHistory, userInstruction, options = {}) {
-  const provider = selectedModelProvider;
-  const model = provider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.security :
-                provider === MODEL_PROVIDERS.groq ? selectedGroqModel :
-                OPENROUTER_MODELS.security;
+  const provider = options.providerOverride || selectedModelProvider;
+  const model = options.modelOverride || (
+    provider === MODEL_PROVIDERS.gemini ? GEMINI_MODELS.security :
+    provider === MODEL_PROVIDERS.groq ? GROQ_MODELS.security :
+    OPENROUTER_MODELS.security
+  );
   return callBackendJson(BACKEND_ENDPOINTS.securityAgent, {
     provider,
     context: {

@@ -126,6 +126,8 @@ const STORAGE_KEYS = {
 };
 
 const SCAN_PACE_VALUES = new Set(['0', '2000', '5000', '8000', 'adaptive']);
+const SCAN_PROFILE_VALUES = new Set(['quick', 'standard', 'deep']);
+let securityScanProfile = 'standard';
 const WORKSPACE_SCHEMA_VERSION = 1;
 const WORKSPACE_HISTORY_LIMIT = 60;
 const WORKSPACE_TEXT_PREVIEW_LIMIT = 320;
@@ -287,7 +289,8 @@ function buildWorkspaceState() {
       selectedGroqModel,
       scanPaceSetting,
       adaptiveScanPacingMs,
-      agentPanelOpen
+      agentPanelOpen,
+      securityScanProfile
     }
   };
 }
@@ -354,6 +357,9 @@ function loadWorkspaceState() {
     }
     if (typeof ui.agentPanelOpen === 'boolean') {
       agentPanelOpen = ui.agentPanelOpen;
+    }
+    if (SCAN_PROFILE_VALUES.has(ui.securityScanProfile)) {
+      securityScanProfile = ui.securityScanProfile;
     }
     renderEnvironmentEditor();
     return true;
@@ -542,6 +548,24 @@ function setScanPace(msRaw) {
     ? 'Adaptive (starts at 2s and auto-adjusts on rate limits)'
     : Number(scanPaceSetting) === 0 ? 'No delay' : `${Math.round(Number(scanPaceSetting) / 1000)}s`;
   addAgentMsg('system', `Scan pace set to ${label}.`, [], { track: false });
+}
+
+function renderSecurityScanProfileControl() {
+  const selectEl = document.getElementById('scan-profile-select');
+  if (!selectEl) return;
+  if (!SCAN_PROFILE_VALUES.has(securityScanProfile)) {
+    securityScanProfile = 'standard';
+  }
+  selectEl.value = securityScanProfile;
+}
+
+function setSecurityScanProfile(raw) {
+  const normalized = String(raw || '').trim();
+  if (!SCAN_PROFILE_VALUES.has(normalized)) return;
+  securityScanProfile = normalized;
+  saveWorkspaceState();
+  renderSecurityScanProfileControl();
+  addAgentMsg('system', `Security scan profile: ${normalized} (affects context width and model guidance).`, [], { track: false });
 }
 
 function getActive() { return requests.find(r => r.id === activeId); }
@@ -1470,6 +1494,7 @@ function getProviderModel(provider, taskType = 'security') {
 function buildSecurityContext(req, resp, userMsg) {
   return {
     target_url: getBaseTargetUrl(req.url),
+    scan_profile: SCAN_PROFILE_VALUES.has(securityScanProfile) ? securityScanProfile : 'standard',
     current_request: {
       method: req.method,
       url: req.url,
@@ -1575,11 +1600,28 @@ function normalizeSecurityAction(action) {
   }
 
   if (action.type === 'scan_plan') {
+    const rawSteps = Array.isArray(action.steps) ? action.steps : [];
+    const steps = rawSteps.map((step, i) => ({
+      order: Number(step?.order || i + 1),
+      vector: typeof step?.vector === 'string' ? step.vector : 'Unknown',
+      description: typeof step?.description === 'string' ? step.description : '',
+      target_param: typeof step?.target_param === 'string' ? step.target_param : '',
+      owasp_api_label: typeof step?.owasp_api_label === 'string' ? step.owasp_api_label : ''
+    }));
+    const param_matrix = Array.isArray(action.param_matrix)
+      ? action.param_matrix
+        .map(entry => ({
+          param: typeof entry?.param === 'string' ? entry.param.trim() : '',
+          location: ['query', 'body', 'header'].includes(String(entry?.location)) ? entry.location : 'query'
+        }))
+        .filter(entry => entry.param)
+      : [];
     return {
       type: 'scan_plan',
       target: typeof action.target === 'string' ? action.target : '',
       method_coverage: Array.isArray(action.method_coverage) ? action.method_coverage : [],
-      steps: Array.isArray(action.steps) ? action.steps : []
+      steps,
+      param_matrix
     };
   }
 
@@ -1609,9 +1651,12 @@ function renderSecurityFindings(findings, threatLevel) {
     const id = escHtml(item.id || 'FINDING');
     const name = escHtml(item.vulnerability || 'Unknown');
     const sev = escHtml(item.severity || 'info');
+    const owasp = item.owasp_api_label
+      ? `<br><span class="security-owasp-label">OWASP: ${escHtml(item.owasp_api_label)}</span>`
+      : '';
     const evidence = escHtml(item.evidence || 'No evidence supplied');
     const remediation = escHtml(item.remediation || 'No remediation supplied');
-    return `<strong>${id} · ${name} (${sev})</strong><br>Evidence: ${evidence}<br>Fix: ${remediation}`;
+    return `<strong>${id} · ${name} (${sev})</strong>${owasp}<br>Evidence: ${evidence}<br>Fix: ${remediation}`;
   });
 
   addAgentMsg('agent', `<strong>Threat level:</strong> ${escHtml(String(threatLevel || 'none').toUpperCase())}<br><br>${lines.join('<br><br>')}`);
@@ -1619,16 +1664,22 @@ function renderSecurityFindings(findings, threatLevel) {
 
 function renderScanPlan(action) {
   const methodCoverage = Array.isArray(action.method_coverage) ? action.method_coverage.join(', ') : '';
+  const matrixLine = Array.isArray(action.param_matrix) && action.param_matrix.length
+    ? `<br>Param matrix: ${escHtml(action.param_matrix.map(m => `${m.param} (${m.location})`).join(', '))}`
+    : '';
   const steps = Array.isArray(action.steps)
     ? action.steps.map(step => {
         const order = Number(step?.order || 0);
         const vector = escHtml(step?.vector || 'Unknown');
         const description = escHtml(step?.description || '');
-        return `${order > 0 ? `${order}. ` : ''}<strong>${vector}</strong> - ${description}`;
+        const stepOwasp = step?.owasp_api_label
+          ? ` <span class="security-owasp-label">[${escHtml(step.owasp_api_label)}]</span>`
+          : '';
+        return `${order > 0 ? `${order}. ` : ''}<strong>${vector}</strong>${stepOwasp} - ${description}`;
       }).join('<br>')
     : '';
 
-  addAgentMsg('agent', `<strong>Security scan plan</strong><br>Target: ${escHtml(action.target || 'current endpoint')}<br>Methods: ${escHtml(methodCoverage || 'n/a')}<br><br>${steps || 'No steps provided.'}`);
+  addAgentMsg('agent', `<strong>Security scan plan</strong><br>Target: ${escHtml(action.target || 'current endpoint')}<br>Methods: ${escHtml(methodCoverage || 'n/a')}${matrixLine}<br><br>${steps || 'No steps provided.'}`);
 }
 
 function renderFuzzList(action) {
@@ -1695,11 +1746,167 @@ function resolveScanTargetUrl(scanPlan) {
   return scanTarget || '';
 }
 
-function buildDeterministicProbeForScanStep(scanPlan, planStep) {
+function resolveProbeParamKey(vector, planStep, scanPlan, candidates) {
+  const candList = Array.isArray(candidates) ? candidates : [];
+  if (planStep && typeof planStep.target_param === 'string' && planStep.target_param.trim()) {
+    return planStep.target_param.trim();
+  }
+  const matrix = Array.isArray(scanPlan?.param_matrix) ? scanPlan.param_matrix : [];
+  const preferLoc = vector === 'NoSQLi' || vector === 'MassAssignment' || vector === 'SSRF' || vector === 'XXE'
+    ? 'body'
+    : 'query';
+  const matrixHit = matrix.find(m => m.param && (m.location === preferLoc || !m.location));
+  if (matrixHit && matrixHit.param) return matrixHit.param;
+
+  const vectorDefaults = {
+    IDOR: ['id', 'userId', 'user_id', 'resourceId'],
+    BOLA: ['id', 'userId', 'resourceId'],
+    SQLi: ['id', 'q', 'search', 'query', 'filter'],
+    PathTraversal: ['file', 'path', 'filename', 'name', 'filepath'],
+    NoSQLi: ['username', 'email', 'password'],
+    ParameterPollution: ['id', 'q']
+  };
+  const defaults = vectorDefaults[vector] || ['id'];
+  const hit = defaults.find(d => candList.includes(d));
+  if (hit) return hit;
+  const first = candList.find(Boolean);
+  if (first) return first;
+  return defaults[0] || 'id';
+}
+
+function evaluateFuzzSuccessIndicators(indicators, { status, text, elapsedMs }) {
+  const ind = indicators && typeof indicators === 'object' ? indicators : {};
+  const codes = Array.isArray(ind.status_codes) ? ind.status_codes.map(Number).filter(Number.isFinite) : [];
+  const needles = Array.isArray(ind.body_contains) ? ind.body_contains.filter(Boolean) : [];
+  const td = Number(ind.time_delta_ms);
+  const hasAny = codes.length > 0 || needles.length > 0 || (Number.isFinite(td) && td > 0);
+  if (!hasAny) return false;
+  if (codes.length && !codes.includes(Number(status))) return false;
+  if (needles.length && !needles.some(n => text.includes(n))) return false;
+  if (Number.isFinite(td) && td > 0 && elapsedMs < td) return false;
+  return true;
+}
+
+function buildFuzzRequestFromListAction(action, payload) {
+  const r = getActive();
+  if (!r) return null;
+  const method = String(r.method || 'GET').toUpperCase();
+  const loc = action.target_location || 'query';
+  const param = action.target_param || 'id';
+  if (loc === 'query') {
+    const params = [...(r.params || [])];
+    const idx = params.findIndex(p => p.k === param);
+    if (idx >= 0) params[idx] = { ...params[idx], v: payload };
+    else params.push({ k: param, v: payload });
+    return { method, url: r.url, headers: [...(r.headers || [])], params, body: r.body || '' };
+  }
+  if (loc === 'header') {
+    const headers = [...(r.headers || [])];
+    const idx = headers.findIndex(h => String(h.k).toLowerCase() === String(param).toLowerCase());
+    if (idx >= 0) headers[idx] = { ...headers[idx], v: payload };
+    else headers.push({ k: param, v: payload });
+    return { method, url: r.url, headers, params: [...(r.params || [])], body: r.body || '' };
+  }
+  if (loc === 'body') {
+    let body = r.body || '';
+    const headers = [...(r.headers || [])];
+    const ct = headers.find(h => String(h.k).toLowerCase() === 'content-type');
+    const isJson = (ct?.v || '').toLowerCase().includes('json') || body.trim().startsWith('{');
+    if (isJson && body.trim()) {
+      try {
+        const obj = JSON.parse(body);
+        if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+          body = JSON.stringify({ ...obj, [param]: payload }, null, 2);
+        } else {
+          body = payload;
+        }
+      } catch {
+        body = payload;
+      }
+    } else {
+      body = payload;
+    }
+    if (!headers.some(h => String(h.k).toLowerCase() === 'content-type') && ['POST', 'PUT', 'PATCH'].includes(method)) {
+      headers.push({ k: 'Content-Type', v: 'application/json' });
+    }
+    return { method, url: r.url, headers, params: [...(r.params || [])], body };
+  }
+  return null;
+}
+
+async function executeFuzzListAction(action) {
+  const payloads = Array.isArray(action.payloads) ? action.payloads : [];
+  if (!payloads.length) {
+    addAgentMsg('system', 'No payloads in fuzz list.');
+    return;
+  }
+  const proceed = window.confirm(
+    `Run ${payloads.length} fuzz requests (${action.target_location || 'query'}.${action.target_param || 'param'})?`
+  );
+  if (!proceed) return;
+
+  const indicators = action.success_indicators || {};
+  const matches = [];
+  for (let i = 0; i < payloads.length; i += 1) {
+    if (agentRunState.stopRequested) break;
+    const payload = payloads[i];
+    const built = buildFuzzRequestFromListAction(action, payload);
+    if (!built) {
+      addAgentMsg('error', 'Could not build fuzz request from the active request.');
+      return;
+    }
+    applySetRequest({
+      type: 'set_request',
+      name: `Fuzz ${i + 1}/${payloads.length}`,
+      method: built.method,
+      url: built.url,
+      headers: built.headers,
+      params: built.params,
+      body: built.body
+    }, { skipMessage: true });
+
+    const response = await sendRequest({
+      confirmMutation: true,
+      skipAutoAssertions: true
+    });
+    if (!response) {
+      matches.push({ index: i + 1, payload, match: false, note: 'request failed', status: 0, elapsedMs: 0 });
+    } else {
+      const text = String(response.text || '');
+      const elapsedMs = Number(response.elapsed || 0);
+      const match = evaluateFuzzSuccessIndicators(indicators, {
+        status: response.status,
+        text,
+        elapsedMs
+      });
+      matches.push({
+        index: i + 1,
+        payload,
+        match,
+        status: response.status,
+        elapsedMs
+      });
+    }
+    const delayMs = i < payloads.length - 1 ? Math.min(getCurrentScanPacingMs(), 3000) : 0;
+    if (delayMs > 0) await waitMs(delayMs);
+  }
+
+  const hitCount = matches.filter(m => m.match).length;
+  const lines = matches.map(m => {
+    const tag = m.match ? 'MATCH' : '—';
+    const snippet = escHtml(String(m.payload || '').slice(0, 80));
+    return `#${m.index} ${tag} status=${m.status} ${snippet}${String(m.payload || '').length > 80 ? '…' : ''}`;
+  }).join('<br>');
+  addAgentMsg('agent', `<strong>Fuzz list results</strong><br>Indicator hits: ${hitCount}/${matches.length}<br><br>${lines}`);
+}
+
+function buildDeterministicProbeForScanStep(scanPlan, planStep, activeRequest) {
   const targetUrl = resolveScanTargetUrl(scanPlan);
   if (!targetUrl) return null;
 
   const vector = String(planStep?.vector || '').trim() || 'Unknown';
+  const candidates = workspaceUtils.collectParamCandidatesFromRequest(activeRequest || {});
+  const paramKey = resolveProbeParamKey(vector, planStep, scanPlan, candidates);
   const baseProbe = {
     type: 'probe',
     name: `${vector} probe`,
@@ -1736,25 +1943,31 @@ function buildDeterministicProbeForScanStep(scanPlan, planStep) {
       return {
         ...baseProbe,
         name: `${vector} identifier manipulation`,
-        params: [{ k: 'id', v: '99999' }],
+        params: [{ k: paramKey, v: '99999' }],
         hypothesis: 'A positive result is access to another object, different authorization behavior, or unexpected data for a manipulated identifier.'
       };
     case 'SQLi':
       return {
         ...baseProbe,
         name: 'SQL injection query check',
-        params: [{ k: 'id', v: "' OR 1=1 --" }],
+        params: [{ k: paramKey, v: "' OR 1=1 --" }],
         hypothesis: 'A positive result is an error signature, altered response shape, or unexpected success on an injected parameter.'
       };
-    case 'NoSQLi':
+    case 'NoSQLi': {
+      const pk = paramKey || 'username';
+      const bodyObj = {
+        [pk]: { $gt: '' },
+        password: { $gt: '' }
+      };
       return {
         ...baseProbe,
         name: 'NoSQL injection body check',
         method: 'POST',
         headers: [{ k: 'Content-Type', v: 'application/json' }],
-        body: JSON.stringify({ username: { $gt: '' }, password: { $gt: '' } }, null, 2),
+        body: JSON.stringify(bodyObj, null, 2),
         hypothesis: 'A positive result is authentication bypass or unexpected acceptance of object operators in JSON input.'
       };
+    }
     case 'MassAssignment':
       return {
         ...baseProbe,
@@ -1768,7 +1981,7 @@ function buildDeterministicProbeForScanStep(scanPlan, planStep) {
       return {
         ...baseProbe,
         name: 'Path traversal filename check',
-        params: [{ k: 'file', v: '../../etc/passwd' }],
+        params: [{ k: paramKey, v: '../../etc/passwd' }],
         hypothesis: 'A positive result is local file content, traversal error leakage, or unusual file resolution behavior.'
       };
     case 'CachePoisoning':
@@ -1810,8 +2023,8 @@ function buildDeterministicProbeForScanStep(scanPlan, planStep) {
         ...baseProbe,
         name: 'Duplicate parameter pollution check',
         params: [
-          { k: 'id', v: '1' },
-          { k: 'id', v: '2' }
+          { k: paramKey, v: '1' },
+          { k: paramKey, v: '2' }
         ],
         hypothesis: 'A positive result is inconsistent routing, merged parameter handling, or unexpected precedence between duplicate parameters.'
       };
@@ -1940,7 +2153,7 @@ async function executeProbeChain(action, options = {}) {
 }
 
 async function generateProbeForScanStep(scanPlan, planStep) {
-  const deterministicProbe = buildDeterministicProbeForScanStep(scanPlan, planStep);
+  const deterministicProbe = buildDeterministicProbeForScanStep(scanPlan, planStep, getActive());
   if (deterministicProbe) {
     return {
       probe: deterministicProbe,
@@ -2505,7 +2718,7 @@ function switchTab(name) {
   document.querySelectorAll('.tab-content').forEach(c => { c.classList.toggle('visible', c.id === 'tab-' + name); });
 }
 
-async function autoSuggestAssertions() {
+async function autoSuggestAssertions(options = {}) {
   if (!lastResponse) return;
   const preview = lastResponse.text?.substring(0, 600);
   try {
@@ -2517,12 +2730,16 @@ async function autoSuggestAssertions() {
       : preferredProvider === MODEL_PROVIDERS.gemini
         ? GEMINI_MODELS.default
         : OPENROUTER_MODELS.default;
-    const parsed = await callBackendJson(BACKEND_ENDPOINTS.assertions, {
+    const payload = {
       status: lastResponse.status,
       body_preview: preview,
       provider: preferredProvider,
-      model: preferredModel
-    });
+      model: preferredModel,
+      mode: typeof options.mode === 'string' ? options.mode : 'functional'
+    };
+    if (Array.isArray(options.assertion_goals)) payload.assertion_goals = options.assertion_goals;
+    if (options.expected_schema !== undefined) payload.expected_schema = options.expected_schema;
+    const parsed = await callBackendJson(BACKEND_ENDPOINTS.assertions, payload);
     const arr = Array.isArray(parsed?.assertions) ? parsed.assertions : [];
     if (!arr.length) return;
     const r = getActive();
@@ -2961,6 +3178,14 @@ async function runSecurityAgent(initialUserMsg) {
           fn: () => executeProbeChain(action, { forceConfirmNonGet: true, sourceLabel: 'manual_probe_chain' })
         });
       }
+
+      if (action.type === 'fuzz_list' && Array.isArray(action.payloads) && action.payloads.length) {
+        chips.push({
+          label: `Run fuzz list (${action.payloads.length})`,
+          cls: 'chain',
+          fn: () => executeFuzzListAction(action)
+        });
+      }
     });
 
     if (agentMode === 'ask' && normalizedActions.length) {
@@ -3194,6 +3419,7 @@ async function callSecurityAgent(targetUrl, currentRequest, lastResponseData, au
     provider,
     context: {
       target_url: targetUrl,
+      scan_profile: SCAN_PROFILE_VALUES.has(securityScanProfile) ? securityScanProfile : 'standard',
       current_request: currentRequest,
       last_response: lastResponseData,
       auth_context: authContext,
@@ -3455,6 +3681,7 @@ function resolveChainTemplate(url) {
   renderSidebar();
   renderModelProvider();
   renderScanPaceControl();
+  renderSecurityScanProfileControl();
   renderAgentMode();
   syncAgentRunControls();
   renderScanProgress();

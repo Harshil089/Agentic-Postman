@@ -2,7 +2,8 @@ const {
   summarizePreview,
   describeRequestDiff,
   resolveChainTemplate,
-  resolveVariableTemplate
+  resolveVariableTemplate,
+  collectParamCandidatesFromRequest
 } = require('../workspace-utils');
 
 describe('workspace-utils', () => {
@@ -51,5 +52,16 @@ describe('workspace-utils', () => {
     const result = resolveVariableTemplate(input, { secret: 'abc123' }, false);
 
     expect(result).toBe('token=abc123&unused=');
+  });
+
+  test('collectParamCandidatesFromRequest merges query, kv params, and json keys', () => {
+    const req = {
+      url: 'https://api.example.com/items?sort=name&page=1',
+      params: [{ k: 'filter', v: 'x' }],
+      headers: [{ k: 'Content-Type', v: 'application/json' }],
+      body: JSON.stringify({ title: 'a', nested: { skip: true } })
+    };
+    const keys = collectParamCandidatesFromRequest(req);
+    expect(keys).toEqual(expect.arrayContaining(['sort', 'page', 'filter', 'title', 'nested']));
   });
 });

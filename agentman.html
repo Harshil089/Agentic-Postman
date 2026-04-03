@@ -249,6 +249,14 @@
                 <option value="adaptive">Adaptive</option>
               </select>
             </div>
+            <div class="model-select-row" id="scan-profile-row">
+              <label for="scan-profile-select" class="provider-label">Scan profile</label>
+              <select class="model-provider-select" id="scan-profile-select" onchange="setSecurityScanProfile(this.value)">
+                <option value="quick">Quick</option>
+                <option value="standard">Standard</option>
+                <option value="deep">Deep</option>
+              </select>
+            </div>
           </div>
 
           <div class="agent-footer">

@@ -4,6 +4,7 @@ const net = require('net');
 const dns = require('dns').promises;
 const express = require('express');
 const dotenv = require('dotenv');
+const workspaceUtils = require('./workspace-utils');
 
 dotenv.config();
 
@@ -556,6 +557,8 @@ CONTEXT YOU RECEIVE PER TURN
 - auth_context      : { type: "none"|"bearer"|"basic"|"apikey", value: string } | null
 - test_history      : [ { method, url, status, finding } ]
 - user_instruction  : plain English command from the tester
+- param_candidates  : string[] — query keys, body keys, and param-table keys from current_request; prefer these for probes/fuzz_list targets instead of guessing "id" only
+- scan_profile      : "quick" | "standard" | "deep" — quick=fewer probes; standard=balanced; deep=more fuzz_list rows and param rotation
 
 OUTPUT CONTRACT - RAW JSON ONLY, ZERO MARKDOWN
 {
@@ -568,6 +571,7 @@ OUTPUT CONTRACT - RAW JSON ONLY, ZERO MARKDOWN
       "severity": "info" | "low" | "medium" | "high" | "critical",
       "evidence": "exact field/value/header from the response that proves this",
       "cve_hint": "CVE-YYYY-NNNNN or CWE-NNN if applicable, else null",
+      "owasp_api_label": "optional OWASP API Top 10 2023 label e.g. API1:2023 Broken Object Level Authorization",
       "remediation": "one sentence fix"
     }
   ],
@@ -643,8 +647,18 @@ ACTION TYPES
   "type": "scan_plan",
   "target": "https://api.target.com/users/{id}",
   "method_coverage": ["GET", "POST", "PUT", "DELETE"],
+  "param_matrix": [
+    { "param": "id", "location": "query" },
+    { "param": "userId", "location": "body" }
+  ],
   "steps": [
-    { "order": 1, "vector": "InfoDisclosure",  "description": "Hit without auth - check for 401 vs 200 vs 403" }
+    {
+      "order": 1,
+      "vector": "InfoDisclosure",
+      "description": "Hit without auth - check for 401 vs 200 vs 403",
+      "target_param": "optional — which param to manipulate for this step",
+      "owasp_api_label": "optional e.g. API5:2023 Broken Function Level Authorization"
+    }
   ]
 }
 
@@ -716,7 +730,9 @@ BEHAVIORAL RULES
 8. For IDOR probes, always test: id-1, id+1, id*2, id=0, id=99999, id=null, id=-1.
 9. For auth tests, always test: no header, wrong scheme, expired token, alg:none JWT, and role-escalated JWT payload.
 10. scan_plan is always the first action when user_instruction contains "scan", "audit", "test all", or "full check".
-11. threat_level escalation is permanent within a session - it never decreases once raised.`;
+11. threat_level escalation is permanent within a session - it never decreases once raised.
+12. When scan_profile is "deep", include param_matrix covering param_candidates where relevant, and add fuzz_list actions for SQLi/NoSQLi on distinct params when safe.
+13. Map findings to OWASP API Top 10 (2023) in owasp_api_label when applicable (API1 Broken Object Level Authorization … API10 Unsafe Consumption of APIs).`;
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(__dirname));
@@ -1294,8 +1310,23 @@ function compactHeaderLikeList(list, maxItems = 8, maxValueLength = 120) {
     .filter(item => item.k);
 }
 
+const SCAN_PROFILES = new Set(['quick', 'standard', 'deep']);
+
+function normalizeScanProfile(raw) {
+  const s = typeof raw === 'string' ? raw.toLowerCase().trim() : '';
+  return SCAN_PROFILES.has(s) ? s : 'standard';
+}
+
 function compactSecurityContext(context, provider) {
   const isGroq = provider === MODEL_PROVIDERS.groq;
+  const scanProfile = normalizeScanProfile(context?.scan_profile);
+  const deep = scanProfile === 'deep';
+  const paramCandidates = workspaceUtils.collectParamCandidatesFromRequest(
+    context?.current_request && typeof context.current_request === 'object'
+      ? context.current_request
+      : {}
+  );
+  const maxCandidates = isGroq ? (deep ? 28 : 18) : deep ? 36 : 28;
   const currentRequest = context?.current_request && typeof context.current_request === 'object'
     ? context.current_request
     : {};
@@ -1304,33 +1335,41 @@ function compactSecurityContext(context, provider) {
     : null;
   const testHistory = Array.isArray(context?.test_history) ? context.test_history : [];
 
+  const bodyLimit = isGroq ? (deep ? 900 : 400) : deep ? 1800 : 1200;
+  const urlLimit = isGroq ? (deep ? 380 : 320) : deep ? 400 : 320;
+  const instructLimit = isGroq ? (deep ? 520 : 320) : deep ? 1600 : 1200;
+  const historyFindingLimit = isGroq ? (deep ? 120 : 90) : deep ? 200 : 180;
+  const respPreviewLimit = isGroq ? (deep ? 900 : 450) : deep ? 1600 : 1200;
+
   return {
     target_url: truncateText(context?.target_url, 240),
+    scan_profile: scanProfile,
+    param_candidates: paramCandidates.slice(0, maxCandidates),
     current_request: {
       method: truncateText(currentRequest.method, 12),
-      url: truncateText(currentRequest.url, 320),
-      headers: compactHeaderLikeList(currentRequest.headers, isGroq ? 6 : 10, isGroq ? 80 : 140),
-      params: compactHeaderLikeList(currentRequest.params, isGroq ? 6 : 10, isGroq ? 80 : 140),
-      body: truncateText(currentRequest.body, isGroq ? 400 : 1200)
+      url: truncateText(currentRequest.url, urlLimit),
+      headers: compactHeaderLikeList(currentRequest.headers, isGroq ? (deep ? 8 : 6) : (deep ? 12 : 10), isGroq ? (deep ? 100 : 80) : (deep ? 160 : 140)),
+      params: compactHeaderLikeList(currentRequest.params, isGroq ? (deep ? 8 : 6) : (deep ? 12 : 10), isGroq ? (deep ? 100 : 80) : (deep ? 160 : 140)),
+      body: truncateText(currentRequest.body, bodyLimit)
     },
     last_response: lastResponse ? {
       status: Number(lastResponse.status || 0),
       elapsed_ms: Number(lastResponse.elapsed_ms || 0),
-      body_preview: truncateText(lastResponse.body_preview, isGroq ? 450 : 1200)
+      body_preview: truncateText(lastResponse.body_preview, respPreviewLimit)
     } : null,
     auth_context: context?.auth_context && typeof context.auth_context === 'object'
       ? {
           type: truncateText(context.auth_context.type, 20),
-          value: truncateText(context.auth_context.value, isGroq ? 80 : 140)
+          value: truncateText(context.auth_context.value, isGroq ? (deep ? 120 : 80) : (deep ? 180 : 140))
         }
       : null,
-    test_history: testHistory.slice(isGroq ? -6 : -12).map(entry => ({
+    test_history: testHistory.slice(isGroq ? (deep ? -8 : -6) : deep ? -16 : -12).map(entry => ({
       method: truncateText(entry?.method, 12),
       url: truncateText(entry?.url, 220),
       status: Number(entry?.status || 0),
-      finding: truncateText(entry?.finding, isGroq ? 90 : 180)
+      finding: truncateText(entry?.finding, historyFindingLimit)
     })),
-    user_instruction: truncateText(context?.user_instruction, isGroq ? 320 : 1200)
+    user_instruction: truncateText(context?.user_instruction, instructLimit)
   };
 }
 
@@ -1724,12 +1763,33 @@ function validateSecurityAction(action, index) {
   }
 
   if (type === 'scan_plan') {
+    const rawSteps = Array.isArray(action.steps) ? action.steps : [];
+    const normalizedSteps = rawSteps.map((step, i) => ({
+      order: Number(step?.order || i + 1),
+      vector: isNonEmptyString(step?.vector) ? step.vector : 'Unknown',
+      description: typeof step?.description === 'string' ? step.description : '',
+      target_param: typeof step?.target_param === 'string' ? step.target_param : '',
+      owasp_api_label: typeof step?.owasp_api_label === 'string' ? step.owasp_api_label : ''
+    }));
+    const param_matrix = Array.isArray(action.param_matrix)
+      ? action.param_matrix
+        .map(entry => ({
+          param: typeof entry?.param === 'string' ? entry.param.trim() : '',
+          location: ['query', 'body', 'header'].includes(String(entry?.location))
+            ? entry.location
+            : 'query'
+        }))
+        .filter(entry => entry.param)
+      : [];
     return {
       value: {
         type,
         target: typeof action.target === 'string' ? action.target : '',
-        method_coverage: Array.isArray(action.method_coverage) ? action.method_coverage : [],
-        steps: Array.isArray(action.steps) ? action.steps : []
+        method_coverage: Array.isArray(action.method_coverage)
+          ? action.method_coverage.map(m => String(m).toUpperCase()).filter(Boolean)
+          : [],
+        steps: normalizedSteps,
+        param_matrix
       }
     };
   }
@@ -1827,6 +1887,9 @@ function parseSecurityPayload(raw) {
       severity: finding.severity,
       evidence: typeof finding.evidence === 'string' ? finding.evidence : '',
       cve_hint: typeof finding.cve_hint === 'string' || finding.cve_hint === null ? finding.cve_hint : null,
+      owasp_api_label: typeof finding.owasp_api_label === 'string' && finding.owasp_api_label.trim()
+        ? truncateText(finding.owasp_api_label, 160)
+        : null,
       remediation: typeof finding.remediation === 'string' ? finding.remediation : ''
     });
   });
@@ -1863,6 +1926,35 @@ function parseAssertionsPayload(raw) {
     throw err;
   }
   return { assertions };
+}
+
+const ASSERTIONS_MODES = new Set(['functional', 'security', 'contract']);
+
+function normalizeAssertionsMode(raw) {
+  const m = typeof raw === 'string' ? raw.toLowerCase().trim() : '';
+  return ASSERTIONS_MODES.has(m) ? m : 'functional';
+}
+
+function buildAssertionsSystemPrompt(mode) {
+  switch (mode) {
+    case 'security':
+      return 'You are an API security testing assistant. Generate assertions that detect verbose errors, stack traces, SQL/NoSQL error signatures, missing authentication when it should be required, and sensitive tokens in plaintext. Use variables: status (number), json (parsed object or null), body (string). Return strict JSON only: {"assertions": string[]}.';
+    case 'contract':
+      return 'You are an API contract testing assistant. Generate assertions that validate required fields, types, and array lengths using expected_schema when provided. Use variables: status, json, body. Return strict JSON only: {"assertions": string[]}.';
+    default:
+      return 'You are an API testing assistant. Return strict JSON only.';
+  }
+}
+
+function buildAssertionsInstructionText(mode) {
+  switch (mode) {
+    case 'security':
+      return 'Generate 5 to 8 assertions as JS expressions. Prefer negative checks (!body.includes), auth expectations, and status gates.';
+    case 'contract':
+      return 'Generate 4 to 8 assertions validating the response against expected_schema and response shape.';
+    default:
+      return 'Generate 4 to 6 useful test assertions as JS expressions using variables: status, json, body. Return shape: {"assertions": ["..."]}.';
+  }
 }
 
 async function parseWithRepairLoop({
@@ -2021,7 +2113,7 @@ app.post('/api/agent', async (req, res) => {
 
 app.post('/api/assertions', async (req, res) => {
   try {
-    const status = req.body?.status;
+    const responseStatus = req.body?.status;
     const bodyPreview = req.body?.body_preview;
     const requestedModel = req.body?.model;
     const hasExplicitModel = typeof requestedModel === 'string' && requestedModel.trim().length > 0;
@@ -2034,17 +2126,25 @@ app.post('/api/assertions', async (req, res) => {
       allowModelFallback: !hasExplicitModel
     });
 
-    if (typeof status !== 'number') {
+    if (typeof responseStatus !== 'number') {
       return res.status(400).json({ error: 'Missing request body field: status (number).' });
     }
 
+    const mode = normalizeAssertionsMode(req.body?.mode);
+    const assertionGoals = Array.isArray(req.body?.assertion_goals)
+      ? req.body.assertion_goals.filter(x => typeof x === 'string' && x.trim()).slice(0, 12)
+      : [];
+    const expectedSchema = req.body?.expected_schema;
     const instruction = {
-      instruction: 'Generate 4 to 6 useful test assertions as JS expressions using variables: status, json, body. Return shape: {"assertions": ["..."]}.',
-      status,
+      mode,
+      instruction: buildAssertionsInstructionText(mode),
+      assertion_goals: assertionGoals,
+      ...(expectedSchema !== undefined && expectedSchema !== null ? { expected_schema: expectedSchema } : {}),
+      status: responseStatus,
       body_preview: typeof bodyPreview === 'string' ? bodyPreview : ''
     };
 
-    const systemPrompt = 'You are an API testing assistant. Return strict JSON only.';
+    const systemPrompt = buildAssertionsSystemPrompt(mode);
     const userContent = JSON.stringify(instruction);
     const runAssertionsGeneration = async ({ systemPromptOverride, userContentOverride }) => {
       const effectiveSystemPrompt = systemPromptOverride || systemPrompt;
@@ -2099,7 +2199,8 @@ app.post('/api/assertions', async (req, res) => {
       initialRaw: initialResult.raw,
       parseFn: parseAssertionsPayload,
       buildRepairInput: ({ error, raw, attempt }) => {
-        const repairSystemPrompt = `${systemPrompt}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON matching {\"assertions\": string[]} with 4-6 assertions.`;
+        const countHint = mode === 'security' ? '5-8' : mode === 'contract' ? '4-8' : '4-6';
+        const repairSystemPrompt = `${systemPrompt}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON matching {\"assertions\": string[]} with ${countHint} assertions.`;
         const repairUserContent = JSON.stringify({
           task: 'repair_assertions_output',
           attempt,
@@ -2117,6 +2218,7 @@ app.post('/api/assertions', async (req, res) => {
 
     return res.json({
       assertions: repaired.payload.assertions,
+      mode,
       diagnostics: {
         ...repaired.diagnostics,
         engine: 'assertions',
@@ -2127,8 +2229,8 @@ app.post('/api/assertions', async (req, res) => {
       }
     });
   } catch (error) {
-    const status = Number(error.status || 500);
-    return res.status(status).json({ error: error.message || 'Failed to generate assertions.' });
+    const errStatus = Number(error.status || 500);
+    return res.status(errStatus).json({ error: error.message || 'Failed to generate assertions.' });
   }
 });
 
@@ -2158,6 +2260,9 @@ app.post('/api/security-agent', async (req, res) => {
 
     if (!context || typeof context !== 'object') {
       return res.status(400).json({ error: 'Missing security context object.' });
+    }
+    if (typeof req.body?.scan_profile === 'string' && context.scan_profile == null) {
+      context.scan_profile = req.body.scan_profile;
     }
 
     const securityUserContent = JSON.stringify(compactSecurityContext(context, provider));

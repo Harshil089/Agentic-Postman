@@ -81,11 +81,67 @@
     });
   }
 
+  /**
+   * Collects query param keys, KV param keys, and JSON body top-level keys for scan/agent context.
+   * @param {object} currentRequest - { url, params[], headers[], body }
+   * @returns {string[]}
+   */
+  function collectParamCandidatesFromRequest(currentRequest) {
+    const keys = new Set();
+    const cr = currentRequest && typeof currentRequest === 'object' ? currentRequest : {};
+    if (Array.isArray(cr.params)) {
+      cr.params.forEach(p => {
+        const k = typeof p?.k === 'string' ? p.k.trim() : '';
+        if (k) keys.add(k);
+      });
+    }
+    const urlRaw = typeof cr.url === 'string' ? cr.url : '';
+    if (urlRaw) {
+      try {
+        const href = urlRaw.includes('://')
+          ? urlRaw
+          : `https://placeholder.invalid${urlRaw.startsWith('/') ? '' : '/'}${urlRaw}`;
+        const u = new URL(href);
+        u.searchParams.forEach((_v, k) => {
+          if (k) keys.add(k);
+        });
+      } catch {
+        const q = urlRaw.indexOf('?');
+        if (q >= 0) {
+          try {
+            const sp = new URLSearchParams(urlRaw.slice(q + 1));
+            sp.forEach((_v, k) => {
+              if (k) keys.add(k);
+            });
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+    const body = typeof cr.body === 'string' ? cr.body : '';
+    const headers = Array.isArray(cr.headers) ? cr.headers : [];
+    const ct = headers.find(h => String(h?.k || '').toLowerCase() === 'content-type');
+    const ctype = ct ? String(ct.v || '').toLowerCase() : '';
+    if (body && (ctype.includes('json') || body.trim().startsWith('{'))) {
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          Object.keys(parsed).slice(0, 40).forEach(k => keys.add(k));
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    return [...keys].filter(Boolean).slice(0, 40);
+  }
+
   const api = {
     summarizePreview,
     describeRequestDiff,
     resolveChainTemplate,
-    resolveVariableTemplate
+    resolveVariableTemplate,
+    collectParamCandidatesFromRequest
   };
 
   if (typeof module !== 'undefined' && module.exports) {

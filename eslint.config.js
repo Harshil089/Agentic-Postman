@@ -1,6 +1,6 @@
 module.exports = [
   {
-    files: ['server.js', 'app.js'],
+    files: ['server.js', 'app.js', 'workspace-utils.js'],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: 'commonjs',
@@ -12,6 +12,7 @@ module.exports = [
         setTimeout: 'readonly',
         clearTimeout: 'readonly',
         URL: 'readonly',
+        URLSearchParams: 'readonly',
         AbortController: 'readonly',
         TextDecoder: 'readonly',
         Node: 'readonly',

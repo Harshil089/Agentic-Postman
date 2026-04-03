@@ -1128,6 +1128,12 @@ body {
 
 .agent-card-badges { gap: 8px; }
 
+.security-owasp-label {
+  font-size: 0.85em;
+  opacity: 0.9;
+  font-weight: 500;
+}
+
 .agent-badge {
   padding: 5px 10px;
   border-radius: 999px;

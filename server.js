@@ -5,6 +5,7 @@ const dns = require('dns').promises;
 const express = require('express');
 const dotenv = require('dotenv');
 const workspaceUtils = require('./workspace-utils');
+const importSpec = require('./import-spec');
 
 dotenv.config();
 
@@ -734,11 +735,43 @@ BEHAVIORAL RULES
 12. When scan_profile is "deep", include param_matrix covering param_candidates where relevant, and add fuzz_list actions for SQLi/NoSQLi on distinct params when safe.
 13. Map findings to OWASP API Top 10 (2023) in owasp_api_label when applicable (API1 Broken Object Level Authorization … API10 Unsafe Consumption of APIs).`;
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 app.use(express.static(__dirname));
 
 app.get('/', (_req, res) => {
   res.sendFile(path.join(__dirname, 'agentman.html'));
+});
+
+app.post('/api/import-openapi', (req, res) => {
+  try {
+    const spec = req.body?.spec ?? req.body;
+    const maxOperations = req.body?.maxOperations;
+    const result = importSpec.parseOpenApiToRequests(spec, { maxOperations });
+    return res.json({
+      requests: result.requests,
+      warnings: result.warnings,
+      truncated: result.truncated
+    });
+  } catch (error) {
+    const status = Number(error.status || 400);
+    return res.status(status).json({ error: error.message || 'OpenAPI import failed.' });
+  }
+});
+
+app.post('/api/import-postman', (req, res) => {
+  try {
+    const collection = req.body?.collection ?? req.body;
+    const maxOperations = req.body?.maxOperations;
+    const result = importSpec.parsePostmanCollectionToRequests(collection, { maxOperations });
+    return res.json({
+      requests: result.requests,
+      warnings: result.warnings,
+      truncated: result.truncated
+    });
+  } catch (error) {
+    const status = Number(error.status || 400);
+    return res.status(status).json({ error: error.message || 'Postman import failed.' });
+  }
 });
 
 function parseProvider(providerRaw) {

@@ -52,6 +52,8 @@
     </div>
     <div class="sidebar-header">
       <span class="sidebar-title" id="sidebar-title">Requests</span>
+      <button class="icon-btn" id="import-spec-btn" title="Import OpenAPI or Postman JSON">↑</button>
+      <input type="file" id="import-spec-input" accept=".json,application/json" style="display:none" aria-hidden="true" />
       <button class="icon-btn" id="new-req-btn" title="New request">+</button>
       <button class="icon-btn" id="clear-errors-btn" title="Clear errors" style="display:none;">×</button>
     </div>
@@ -75,6 +77,7 @@
       <div class="tab" data-tab="body">Body</div>
       <div class="tab" data-tab="env">Env</div>
       <div class="tab" data-tab="assertions">Assertions <span class="tab-badge" id="assertion-count">0</span></div>
+      <div class="tab" data-tab="snapshots">Snapshots</div>
     </div>
 
     <div class="editor-area">
@@ -123,8 +126,29 @@
       </div>
       <!-- Assertions -->
       <div class="tab-content" id="tab-assertions">
+        <div class="assertions-toolbar">
+          <div class="assertions-toolbar-row">
+            <label for="assertion-gen-mode" class="assertions-label">Mode</label>
+            <select id="assertion-gen-mode" class="assertion-gen-select">
+              <option value="functional">Functional</option>
+              <option value="security">Security</option>
+              <option value="contract">Contract</option>
+            </select>
+            <button type="button" class="send-btn assertion-gen-btn" id="assertion-generate-btn">Generate with AI</button>
+          </div>
+          <label for="assertion-gen-goals" class="assertions-label">Goals (optional, one per line)</label>
+          <textarea id="assertion-gen-goals" class="assertion-gen-textarea" rows="2" placeholder="e.g. reject anonymous access"></textarea>
+          <label for="assertion-gen-schema" class="assertions-label">expected_schema (optional JSON)</label>
+          <textarea id="assertion-gen-schema" class="assertion-gen-textarea" rows="3" placeholder='{"type":"object","properties":{"id":{"type":"number"}}}'></textarea>
+          <p class="assertions-hint">Uses the last response. Variables: <code>status</code>, <code>json</code>, <code>body</code>, <code>elapsed_ms</code>, <code>elapsed</code>. Timing assertions can be flaky on slow networks.</p>
+        </div>
         <div id="assertions-list"></div>
         <button class="add-row-btn" style="margin-top:4px;" onclick="addManualAssertion()">+ Add assertion</button>
+      </div>
+
+      <!-- Snapshots (Regression) -->
+      <div class="tab-content" id="tab-snapshots">
+        <div id="snapshots-panel"></div>
       </div>
     </div>
 

@@ -8,7 +8,7 @@
     "dev": "node server.js",
     "test": "jest --runInBand",
     "test:watch": "jest --watch",
-    "lint": "eslint server.js app.js workspace-utils.js test/**/*.test.js",
+    "lint": "eslint server.js app.js workspace-utils.js import-spec.js test/**/*.test.js",
     "ci": "npm run lint && npm run test && npm audit --audit-level=high"
   },
   "dependencies": {

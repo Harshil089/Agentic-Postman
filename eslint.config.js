@@ -1,6 +1,6 @@
 module.exports = [
   {
-    files: ['server.js', 'app.js', 'workspace-utils.js'],
+    files: ['server.js', 'app.js', 'workspace-utils.js', 'import-spec.js'],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: 'commonjs',

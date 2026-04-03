@@ -81,6 +81,154 @@
     });
   }
 
+  function arrayBufferToHex(buffer) {
+    const bytes = new Uint8Array(buffer);
+    return Array.from(bytes)
+      .map(byte => byte.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  async function computeSha256Hash(text) {
+    if (typeof text !== 'string') {
+      return '';
+    }
+    try {
+      const Encoder = (typeof globalThis !== 'undefined' && globalThis.TextEncoder) ? globalThis.TextEncoder : null;
+      if (!Encoder) return '';
+      if (typeof globalScope !== 'undefined' && globalScope.crypto && globalScope.crypto.subtle) {
+        const encoder = new Encoder();
+        const data = encoder.encode(text);
+        const hashBuffer = await globalScope.crypto.subtle.digest('SHA-256', data);
+        return arrayBufferToHex(hashBuffer);
+      } else if (typeof globalThis !== 'undefined' && globalThis.crypto && globalThis.crypto.subtle) {
+        const encoder = new Encoder();
+        const data = encoder.encode(text);
+        const hashBuffer = await globalThis.crypto.subtle.digest('SHA-256', data);
+        return arrayBufferToHex(hashBuffer);
+      }
+    } catch {
+      /* fallback if crypto unavailable */
+    }
+    return '';
+  }
+
+  function compareToSnapshot(request, response, snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      return null;
+    }
+    const safeRequest = request && typeof request === 'object' ? request : {};
+    const safeResponse = response && typeof response === 'object' ? response : {};
+
+    const result = {
+      matches: true,
+      assertions: {
+        pass: 0,
+        fail: 0,
+        changes: []
+      },
+      response: {
+        statusMatch: true,
+        statusDelta: null,
+        timingDelta: null,
+        bodyHashMatch: true,
+        headerChanges: []
+      },
+      notes: ''
+    };
+
+    // Compare status
+    const currentStatus = Number(safeResponse.status) || 0;
+    const expectedStatus = Number(snapshot.status) || 0;
+    if (currentStatus !== expectedStatus) {
+      result.response.statusMatch = false;
+      result.response.statusDelta = { expected: expectedStatus, actual: currentStatus };
+      result.matches = false;
+    }
+
+    // Compare timing
+    const currentElapsed = Number(safeResponse.elapsed) || Number(safeResponse.elapsedMs) || 0;
+    const expectedElapsed = Number(snapshot.elapsedMs) || 0;
+    if (currentElapsed !== expectedElapsed) {
+      const delta = currentElapsed - expectedElapsed;
+      result.response.timingDelta = { expected: expectedElapsed, actual: currentElapsed, delta };
+    }
+
+    // Compare body hash (if both exist)
+    const currentBodyHash = typeof safeResponse.bodyHash === 'string' ? safeResponse.bodyHash : '';
+    const expectedBodyHash = typeof snapshot.responseBodyHash === 'string' ? snapshot.responseBodyHash : '';
+    if (currentBodyHash && expectedBodyHash && currentBodyHash !== expectedBodyHash) {
+      result.response.bodyHashMatch = false;
+      result.matches = false;
+    }
+
+    // Compare assertions
+    const snapshotAssertions = Array.isArray(snapshot.assertions) ? snapshot.assertions : [];
+    const currentAssertions = Array.isArray(safeRequest.assertions) ? safeRequest.assertions : [];
+    
+    if (snapshotAssertions.length > 0) {
+      snapshotAssertions.forEach(snap => {
+        const curr = currentAssertions.find(a => a.expr === snap.expr);
+        if (curr) {
+          if (curr.status === 'pass') {
+            result.assertions.pass += 1;
+          } else {
+            result.assertions.fail += 1;
+            result.assertions.changes.push({
+              expr: snap.expr,
+              expected: 'pass',
+              actual: curr.status,
+              status: curr.status
+            });
+            result.matches = false;
+          }
+        }
+      });
+    }
+
+    // Compare headers (sample key changes)
+    const snapshotHeaders = snapshot.responseHeaders && typeof snapshot.responseHeaders === 'object' 
+      ? snapshot.responseHeaders 
+      : {};
+    const currentHeaders = safeResponse.headers && typeof safeResponse.headers === 'object' 
+      ? safeResponse.headers 
+      : {};
+    
+    const allHeaderKeys = new Set([...Object.keys(snapshotHeaders), ...Object.keys(currentHeaders)]);
+    const sampleHeadersToTrack = Array.from(allHeaderKeys).slice(0, 5);
+    
+    sampleHeadersToTrack.forEach(key => {
+      const snapVal = snapshotHeaders[key];
+      const currVal = currentHeaders[key];
+      if (currVal === undefined && snapVal !== undefined) {
+        result.response.headerChanges.push({ key, status: 'removed' });
+      } else if (currVal !== undefined && snapVal === undefined) {
+        result.response.headerChanges.push({ key, status: 'added' });
+      } else if (currVal !== snapVal) {
+        result.response.headerChanges.push({ key, status: 'changed' });
+      }
+    });
+
+    // Generate human-readable notes
+    const notes = [];
+    if (!result.response.statusMatch) {
+      notes.push(`Status mismatch (${expectedStatus}→${currentStatus})`);
+    }
+    if (result.response.timingDelta) {
+      const sign = result.response.timingDelta.delta >= 0 ? '+' : '';
+      notes.push(`timing ${sign}${result.response.timingDelta.delta}ms`);
+    }
+    if (!result.response.bodyHashMatch) {
+      notes.push('body hash mismatch');
+    }
+    if (result.assertions.fail > 0) {
+      notes.push(`${result.assertions.fail} assertion(s) failed`);
+    }
+    
+    result.notes = notes.length > 0 ? notes.join(', ') : 'Matches baseline';
+
+    return result;
+  }
+
   /**
    * Collects query param keys, KV param keys, and JSON body top-level keys for scan/agent context.
    * @param {object} currentRequest - { url, params[], headers[], body }
@@ -141,7 +289,10 @@
     describeRequestDiff,
     resolveChainTemplate,
     resolveVariableTemplate,
-    collectParamCandidatesFromRequest
+    collectParamCandidatesFromRequest,
+    arrayBufferToHex,
+    computeSha256Hash,
+    compareToSnapshot
   };
 
   if (typeof module !== 'undefined' && module.exports) {

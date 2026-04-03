@@ -208,4 +208,26 @@ describe('/api/request', () => {
     expect(fetchCall[1].headers.Host).toBeUndefined();
     expect(fetchCall[1].headers['X-Custom']).toBe('ok');
   });
+
+  test('POST /api/import-openapi returns normalized requests', async () => {
+    const app = loadAppWithEnv();
+    const res = await request(app)
+      .post('/api/import-openapi')
+      .send({
+        spec: {
+          openapi: '3.0.0',
+          paths: {
+            '/items': {
+              get: { operationId: 'listItems' }
+            }
+          }
+        }
+      });
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.requests)).toBe(true);
+    expect(res.body.requests.length).toBe(1);
+    expect(res.body.requests[0].method).toBe('GET');
+    expect(res.body.requests[0].importMeta.param_candidates).toBeDefined();
+  });
 });

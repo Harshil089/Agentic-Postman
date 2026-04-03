@@ -40,7 +40,9 @@ const BACKEND_ENDPOINTS = {
   assertions: '/api/assertions',
   request: '/api/request',
   securityAgent: '/api/security-agent',
-  config: '/api/config'
+  config: '/api/config',
+  importOpenapi: '/api/import-openapi',
+  importPostman: '/api/import-postman'
 };
 
 const AGENT_WELCOME_HTML = `
@@ -64,6 +66,7 @@ let requests = [
 ];
 let activeId = 1;
 let lastResponse = null;
+let lastComparisonResult = null;
 let idCounter = 3;
 let agentMode = 'agent';
 let selectedModelProvider = MODEL_PROVIDERS.openrouter;
@@ -79,9 +82,11 @@ let structuredDiagnosticsEntries = [];
 let requestHistoryEntries = [];
 let environments = [];
 let activeEnvironmentId = 'default';
+let snapshots = [];
 let scanPaceSetting = '0';
 let adaptiveScanPacingMs = 2000;
 let agentPanelOpen = true;
+let compareSnapshotsOnSend = true;
 let requestHistoryIdCounter = 1;
 const AGENT_INPUT_MAX_CHARS = 2000;
 const scanProgressState = {
@@ -128,7 +133,7 @@ const STORAGE_KEYS = {
 const SCAN_PACE_VALUES = new Set(['0', '2000', '5000', '8000', 'adaptive']);
 const SCAN_PROFILE_VALUES = new Set(['quick', 'standard', 'deep']);
 let securityScanProfile = 'standard';
-const WORKSPACE_SCHEMA_VERSION = 1;
+const WORKSPACE_SCHEMA_VERSION = 2;
 const WORKSPACE_HISTORY_LIMIT = 60;
 const WORKSPACE_TEXT_PREVIEW_LIMIT = 320;
 const DEFAULT_ENVIRONMENT_ID = 'default';
@@ -186,11 +191,22 @@ function sanitizeAssertionEntries(assertions) {
     : [];
 }
 
+function normalizeImportMeta(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = typeof raw.source === 'string' ? raw.source : '';
+  const param_candidates = Array.isArray(raw.param_candidates)
+    ? raw.param_candidates.filter(x => typeof x === 'string').slice(0, 40)
+    : [];
+  if (!source && !param_candidates.length) return null;
+  return { source, param_candidates };
+}
+
 function normalizeRequestRecord(record, fallbackId) {
   const source = record && typeof record === 'object' ? record : {};
   const numericId = Number(source.id);
   const id = Number.isFinite(numericId) && numericId > 0 ? numericId : fallbackId;
   const method = typeof source.method === 'string' ? source.method.toUpperCase() : 'GET';
+  const importMeta = normalizeImportMeta(source.importMeta);
   return {
     id,
     name: typeof source.name === 'string' && source.name.trim() ? source.name : `Request ${id}`,
@@ -201,7 +217,8 @@ function normalizeRequestRecord(record, fallbackId) {
     body: typeof source.body === 'string' ? source.body : '',
     assertions: sanitizeAssertionEntries(source.assertions),
     chainOf: Number.isFinite(Number(source.chainOf)) ? Number(source.chainOf) : null,
-    chainNote: typeof source.chainNote === 'string' ? source.chainNote : ''
+    chainNote: typeof source.chainNote === 'string' ? source.chainNote : '',
+    ...(importMeta ? { importMeta } : {})
   };
 }
 
@@ -259,6 +276,32 @@ function normalizeHistoryEntry(entry) {
   };
 }
 
+function normalizeSnapshotRecord(snapshot) {
+  const source = snapshot && typeof snapshot === 'object' ? snapshot : {};
+  return {
+    id: typeof source.id === 'string' && source.id.trim() ? source.id : `snap-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    requestId: Number.isFinite(Number(source.requestId)) ? Number(source.requestId) : 0,
+    environmentId: typeof source.environmentId === 'string' ? source.environmentId : DEFAULT_ENVIRONMENT_ID,
+    createdAt: typeof source.createdAt === 'string' && source.createdAt.trim() ? source.createdAt : new Date().toISOString(),
+    assertions: sanitizeAssertionEntries(source.assertions),
+    status: Number.isFinite(Number(source.status)) ? Number(source.status) : 0,
+    statusText: typeof source.statusText === 'string' ? source.statusText : '',
+    elapsedMs: Number.isFinite(Number(source.elapsedMs)) ? Number(source.elapsedMs) : 0,
+    responseBodyHash: typeof source.responseBodyHash === 'string' ? source.responseBodyHash : '',
+    responseHeaders: source.responseHeaders && typeof source.responseHeaders === 'object' ? cloneSerializable(source.responseHeaders) || {} : {},
+    responsePreviewFirst: typeof source.responsePreviewFirst === 'string' ? source.responsePreviewFirst : '',
+    notes: typeof source.notes === 'string' ? source.notes.slice(0, 200) : ''
+  };
+}
+
+function migrateWorkspaceV1toV2(v1State) {
+  return {
+    ...cloneSerializable(v1State),
+    version: 2,
+    snapshots: []
+  };
+}
+
 function summarizePreview(text, limit = WORKSPACE_TEXT_PREVIEW_LIMIT) {
   return workspaceUtils.summarizePreview(text, limit);
 }
@@ -282,6 +325,7 @@ function buildWorkspaceState() {
     requestHistoryIdCounter,
     environments: cloneSerializable(environments) || [],
     activeEnvironmentId,
+    snapshots: cloneSerializable(snapshots) || [],
     ui: {
       activeSidebarWindow,
       agentMode,
@@ -290,7 +334,8 @@ function buildWorkspaceState() {
       scanPaceSetting,
       adaptiveScanPacingMs,
       agentPanelOpen,
-      securityScanProfile
+      securityScanProfile,
+      compareSnapshotsOnSend
     }
   };
 }
@@ -305,8 +350,16 @@ function loadWorkspaceState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEYS.workspace);
     if (!raw) return false;
-    const stored = parseJsonSafely(raw);
-    if (!stored || typeof stored !== 'object' || Number(stored.version) !== WORKSPACE_SCHEMA_VERSION) return false;
+    let stored = parseJsonSafely(raw);
+    if (!stored || typeof stored !== 'object') return false;
+    
+    // Migrate from v1 to v2 if needed
+    const storedVersion = Number(stored.version);
+    if (storedVersion === 1) {
+      stored = migrateWorkspaceV1toV2(stored);
+    }
+    
+    if (Number(stored.version) !== WORKSPACE_SCHEMA_VERSION) return false;
 
     const restoredRequests = Array.isArray(stored.requests)
       ? stored.requests.map((request, index) => normalizeRequestRecord(request, index + 1))
@@ -336,6 +389,10 @@ function loadWorkspaceState() {
       ? storedEnvironmentId
       : environments[0].id;
 
+    snapshots = Array.isArray(stored.snapshots)
+      ? stored.snapshots.map(snap => normalizeSnapshotRecord(snap))
+      : [];
+
     const ui = stored.ui && typeof stored.ui === 'object' ? stored.ui : {};
     if (typeof ui.activeSidebarWindow === 'string' && ['requests', 'history', 'errors', 'diagnostics'].includes(ui.activeSidebarWindow)) {
       activeSidebarWindow = ui.activeSidebarWindow;
@@ -361,11 +418,15 @@ function loadWorkspaceState() {
     if (SCAN_PROFILE_VALUES.has(ui.securityScanProfile)) {
       securityScanProfile = ui.securityScanProfile;
     }
+    if (typeof ui.compareSnapshotsOnSend === 'boolean') {
+      compareSnapshotsOnSend = ui.compareSnapshotsOnSend;
+    }
     renderEnvironmentEditor();
     return true;
   } catch {
     environments = [createDefaultEnvironment()];
     activeEnvironmentId = DEFAULT_ENVIRONMENT_ID;
+    snapshots = [];
     return false;
   }
 }
@@ -687,6 +748,280 @@ function deleteActiveEnvironment() {
   activeEnvironmentId = environments[0].id;
   renderEnvironmentEditor();
   saveWorkspaceState();
+}
+
+// ============ Snapshot (Regression) Functions ============
+
+function getSnapshotKeyForRequest(requestId, envId = null) {
+  const env = envId || activeEnvironmentId;
+  return `${requestId}__${env}`;
+}
+
+async function saveCurrentResponseAsSnapshot(request, response, notes = '') {
+  if (!request || !response) return null;
+  
+  // Compute body hash asynchronously
+  let bodyHash = '';
+  if (response.text && typeof response.text === 'string') {
+    bodyHash = await workspaceUtils.computeSha256Hash(response.text);
+  }
+
+  const snapshot = {
+    id: `snap-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    requestId: request.id,
+    environmentId: activeEnvironmentId,
+    createdAt: new Date().toISOString(),
+    assertions: request.assertions ? cloneSerializable(request.assertions) : [],
+    status: Number(response.status) || 0,
+    statusText: response.statusText || '',
+    elapsedMs: Number(response.elapsed) || Number(response.elapsedMs) || 0,
+    responseBodyHash: bodyHash,
+    responseHeaders: response.headers && typeof response.headers === 'object' ? cloneSerializable(response.headers) : {},
+    responsePreviewFirst: summarizePreview(response.text, WORKSPACE_TEXT_PREVIEW_LIMIT),
+    notes: String(notes).slice(0, 200)
+  };
+
+  snapshots.push(snapshot);
+  saveWorkspaceState();
+  return snapshot;
+}
+
+function getSnapshotsForRequest(requestId, envId = null) {
+  const env = envId || activeEnvironmentId;
+  return snapshots
+    .filter(s => s.requestId === requestId && s.environmentId === env)
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+}
+
+function getSnapshotForRequest(requestId, envId = null) {
+  const list = getSnapshotsForRequest(requestId, envId);
+  return list.length ? list[0] : null;
+}
+
+async function compareCurrentResponseToSnapshot(request, response) {
+  if (!request || !response) return null;
+  if (!compareSnapshotsOnSend) return null;
+  const snapshot = getSnapshotForRequest(request.id);
+  if (!snapshot) return null;
+
+  // Compute current response hash
+  let bodyHash = '';
+  if (response.text && typeof response.text === 'string') {
+    bodyHash = await workspaceUtils.computeSha256Hash(response.text);
+  }
+
+  const responseWithHash = { ...response, bodyHash };
+  return workspaceUtils.compareToSnapshot(request, responseWithHash, snapshot);
+}
+
+function deleteSnapshot(snapshotId) {
+  snapshots = snapshots.filter(s => s.id !== snapshotId);
+  saveWorkspaceState();
+}
+
+function exportSnapshotsForActiveRequest() {
+  const activeRequest = getActive();
+  if (!activeRequest) return;
+  const payload = {
+    version: WORKSPACE_SCHEMA_VERSION,
+    exportedAt: new Date().toISOString(),
+    requestId: activeRequest.id,
+    requestName: activeRequest.name,
+    snapshots: snapshots.filter(s => s.requestId === activeRequest.id)
+  };
+  const json = JSON.stringify(payload, null, 2);
+  const blob = new window.Blob([json], { type: 'application/json' });
+  const url = window.URL.createObjectURL(blob);
+  const safeName = String(activeRequest.name || 'request').replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'request';
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `snapshots-${safeName}-${activeRequest.id}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+}
+
+function renderSnapshotsPanel() {
+  const panel = document.getElementById('snapshots-panel');
+  if (!panel) return;
+
+  const activeRequest = getActive();
+  if (!activeRequest) {
+    panel.innerHTML = '<p style="padding: 12px; color: var(--text2);">No active request</p>';
+    return;
+  }
+
+  const snapshot = getSnapshotForRequest(activeRequest.id);
+  const snapshotList = getSnapshotsForRequest(activeRequest.id);
+  const lastComparison = lastComparisonResult || null;
+
+  let html = '<div class="snapshots-panel">';
+
+  // Section 1: Current snapshot for this environment
+  html += '<div class="snap-section">';
+  html += '<h4 class="snap-section-title">Snapshots for this request</h4>';
+  
+  // Environment selector
+  html += '<div class="snap-env-selector">';
+  html += '<label>Environment: </label>';
+  html += '<select id="snap-env-select" style="padding: 6px; margin-bottom: 8px;">';
+  environments.forEach(env => {
+    const selected = env.id === activeEnvironmentId ? 'selected' : '';
+    html += `<option value="${env.id}" ${selected}>${env.name}</option>`;
+  });
+  html += '</select>';
+  html += '</div>';
+
+  if (snapshot) {
+    const createdDate = new Date(snapshot.createdAt).toLocaleString();
+    html += `<div style="font-size: 0.85rem; color: var(--text2); margin-bottom: 8px;">`;
+    html += `Created: ${createdDate}<br>`;
+    if (snapshot.notes) {
+      html += `Notes: ${escHtml(snapshot.notes)}`;
+    }
+    html += `</div>`;
+    html += `<button class="btn btn-small" id="delete-snapshot-btn" data-snapshot-id="${snapshot.id}">Delete Latest</button>`;
+  } else {
+    html += '<p style="color: var(--text2); font-size: 0.85rem;">No snapshot yet for this environment</p>';
+  }
+  html += `<button class="btn btn-small" id="export-snapshots-btn" style="margin-left:8px;">Export JSON</button>`;
+
+  if (snapshotList.length > 0) {
+    html += '<div style="margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px;">';
+    html += '<div style="font-size: 0.8rem; color: var(--text2); margin-bottom: 6px;">Snapshot history (latest first)</div>';
+    html += '<div style="display:flex; flex-direction:column; gap:6px; max-height:180px; overflow:auto;">';
+    snapshotList.slice(0, 10).forEach((item, index) => {
+      const dt = new Date(item.createdAt).toLocaleString();
+      const hash = item.responseBodyHash ? item.responseBodyHash.slice(0, 8) : 'nohash';
+      const notes = item.notes ? escHtml(item.notes) : '';
+      html += '<div style="border:1px solid var(--border); border-radius:4px; padding:6px 8px;">';
+      html += `<div style="font-size:0.8rem; color:var(--text2);">#${index + 1} ${dt}</div>`;
+      html += `<div style="font-size:0.82rem;">${item.status} • ${item.elapsedMs}ms • ${hash}</div>`;
+      if (notes) html += `<div style="font-size:0.78rem; color:var(--text2); margin-top:2px;">${notes}</div>`;
+      html += `<button class="btn btn-small snap-delete-item-btn" data-snapshot-id="${item.id}" style="margin-top:6px;">Delete</button>`;
+      html += '</div>';
+    });
+    html += '</div></div>';
+  }
+  html += '</div>';
+
+  // Section 2: Save new snapshot
+  html += '<div class="snap-section" style="margin-top: 16px;">';
+  html += '<h4 class="snap-section-title">Save current response as snapshot</h4>';
+  
+  if (lastResponse) {
+    const hash = lastResponse.bodyHash ? lastResponse.bodyHash.slice(0, 8) : 'N/A';
+    html += `<div style="font-size: 0.85rem; color: var(--text2); margin-bottom: 8px;">`;
+    html += `Status: ${lastResponse.status} ${lastResponse.statusText || ''}<br>`;
+    html += `Elapsed: ${lastResponse.elapsed || 0} ms<br>`;
+    html += `Body hash: ${hash}...`;
+    html += `</div>`;
+    
+    html += `<textarea id="snap-notes-input" placeholder="Optional notes (max 200 chars)" style="width: 100%; height: 60px; margin-bottom: 8px; padding: 6px; border: 1px solid var(--border); border-radius: 4px; font-family: inherit; font-size: 0.9rem;" maxlength="200"></textarea>`;
+    html += `<label style="display: flex; gap: 8px; margin-bottom: 8px; font-size: 0.9rem;">`;
+    html += `<input type="checkbox" id="snap-compare-on-send" ${compareSnapshotsOnSend ? 'checked' : ''}>`;
+    html += `Compare to snapshot on every send`;
+    html += `</label>`;
+    html += `<button class="btn btn-primary btn-small" id="save-snapshot-btn">Save snapshot</button>`;
+  } else {
+    html += '<p style="color: var(--text2); font-size: 0.85rem;">Send a request first to save a snapshot.</p>';
+  }
+  html += '</div>';
+
+  // Section 3: Comparison result
+  if (lastComparison) {
+    html += '<div class="snap-section" style="margin-top: 16px;">';
+    html += '<h4 class="snap-section-title">Comparison result</h4>';
+    
+    const badgeClass = lastComparison.matches ? 'snap-badge-match' : 'snap-badge-mismatch';
+    const badgeText = lastComparison.matches ? '✓ Matches baseline' : '✗ Regression detected';
+    html += `<div class="${badgeClass}" style="padding: 8px; margin-bottom: 12px; border-radius: 4px; font-weight: bold;">`;
+    html += badgeText;
+    html += `</div>`;
+
+    if (lastComparison.notes) {
+      html += `<p style="font-size: 0.85rem; color: var(--text2); margin: 0;">`;
+      html += escHtml(lastComparison.notes);
+      html += `</p>`;
+    }
+
+    if (!lastComparison.response.statusMatch) {
+      const delta = lastComparison.response.statusDelta;
+      html += `<p style="font-size: 0.8rem; color: #d64545; margin: 4px 0;">Status: ${delta.expected} → ${delta.actual}</p>`;
+    }
+    if (lastComparison.response.timingDelta) {
+      const delta = lastComparison.response.timingDelta.delta;
+      const sign = delta >= 0 ? '+' : '';
+      html += `<p style="font-size: 0.8rem; color: var(--text2); margin: 4px 0;">Timing: ${sign}${delta}ms</p>`;
+    }
+    if (lastComparison.assertions.fail > 0) {
+      html += `<p style="font-size: 0.8rem; color: #d64545; margin: 4px 0;">Failed assertions: ${lastComparison.assertions.fail}</p>`;
+    }
+    if (lastComparison.response.headerChanges.length > 0) {
+      html += `<p style="font-size: 0.8rem; color: var(--text2); margin: 4px 0;">Header changes: ${lastComparison.response.headerChanges.map(h => `${h.key} (${h.status})`).join(', ')}</p>`;
+    }
+
+    html += '</div>';
+  }
+
+  html += '</div>';
+  panel.innerHTML = html;
+
+  // Event listeners
+  const deleteBtn = panel.querySelector('#delete-snapshot-btn');
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const snapId = deleteBtn.getAttribute('data-snapshot-id');
+      deleteSnapshot(snapId);
+      renderSnapshotsPanel();
+    });
+  }
+  panel.querySelectorAll('.snap-delete-item-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      const snapId = btn.getAttribute('data-snapshot-id');
+      deleteSnapshot(snapId);
+      renderSnapshotsPanel();
+    });
+  });
+
+  const exportBtn = panel.querySelector('#export-snapshots-btn');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      exportSnapshotsForActiveRequest();
+    });
+  }
+
+  const saveBtn = panel.querySelector('#save-snapshot-btn');
+  if (saveBtn) {
+    saveBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const notes = panel.querySelector('#snap-notes-input')?.value || '';
+      await saveCurrentResponseAsSnapshot(activeRequest, lastResponse, notes);
+      renderSnapshotsPanel();
+      addAgentMsg('system', 'Snapshot saved.', [], { track: false });
+    });
+  }
+
+  const envSelect = panel.querySelector('#snap-env-select');
+  if (envSelect) {
+    envSelect.addEventListener('change', (e) => {
+      activeEnvironmentId = e.target.value;
+      saveWorkspaceState();
+      renderSnapshotsPanel();
+    });
+  }
+
+  const compareToggle = panel.querySelector('#snap-compare-on-send');
+  if (compareToggle) {
+    compareToggle.addEventListener('change', (e) => {
+      compareSnapshotsOnSend = Boolean(e.target.checked);
+      saveWorkspaceState();
+    });
+  }
 }
 
 function renderSidebar() {
@@ -1377,6 +1712,7 @@ async function sendRequest(options = {}) {
     let formatted = text;
     try { formatted = JSON.stringify(JSON.parse(text), null, 2); } catch {}
     lastResponse = { status: data.status, text: formatted, elapsed, headers: data.headers || {}, url };
+    lastResponse.bodyHash = await workspaceUtils.computeSha256Hash(formatted);
 
     const stEl = document.getElementById('status-tag');
     stEl.textContent = `${data.status} ${data.statusText || ''}`.trim();
@@ -1386,6 +1722,11 @@ async function sendRequest(options = {}) {
 
     runAssertions(r.assertions, lastResponse);
     recordRequestHistoryEntry(r, lastResponse);
+
+    lastComparisonResult = null;
+    // Compare to regression snapshot if one exists
+    lastComparisonResult = await compareCurrentResponseToSnapshot(r, lastResponse);
+    
     if (r.assertions.length === 0 && !skipAutoAssertions) autoSuggestAssertions();
     return lastResponse;
   } catch (e) {
@@ -2670,7 +3011,10 @@ function renderAssertions(list) {
   const el = document.getElementById('assertions-list');
   const count = document.getElementById('assertion-count');
   count.textContent = (list || []).length;
-  if (!list || list.length === 0) { el.innerHTML = `<div style="color:var(--text3);font-size:12px;padding:8px;">No assertions yet. Ask the agent to generate them after sending.</div>`; return; }
+  if (!list || list.length === 0) {
+    el.innerHTML = `<div style="color:var(--text3);font-size:12px;padding:8px;">No assertions yet. Send a request, then use <strong>Generate with AI</strong> below (or ask the agent).</div>`;
+    return;
+  }
   el.innerHTML = list.map((a, i) => `
     <div class="assertion-item">
       <div class="assertion-status ${a.status === 'pass' ? 'a-pass' : a.status === 'fail' ? 'a-fail' : 'a-pending'}"></div>
@@ -2686,13 +3030,17 @@ function runAssertions(assertions, resp) {
   let parsed;
   try { parsed = JSON.parse(resp.text); } catch {}
 
+  const elapsedMs = Number(resp.elapsed ?? resp.elapsed_ms ?? 0);
+
   assertions.forEach(a => {
     try {
       const result = evaluateAssertionExpression(a.expr, {
         status: resp.status,
         body: resp.text,
         json: parsed,
-        Array
+        Array,
+        elapsed_ms: elapsedMs,
+        elapsed: elapsedMs
       });
       a.status = result ? 'pass' : 'fail';
       if (!result) a.error = 'returned false';
@@ -2708,14 +3056,114 @@ function removeAssertion(i) {
 }
 
 function addManualAssertion() {
-  const expr = prompt('Assertion expression (JS):\nVariables: status, json, body\n\nExample: status === 200');
+  const expr = prompt('Assertion expression (JS):\nVariables: status, json, body, elapsed_ms, elapsed\n\nExample: status === 200');
   if (!expr) return;
   const r = getActive(); r.assertions.push({ expr, status: 'pending' }); renderAssertions(r.assertions); saveWorkspaceState();
+}
+
+function detectImportKind(json) {
+  if (!json || typeof json !== 'object') return null;
+  if (Array.isArray(json.item) && json.info && typeof json.info === 'object') return 'postman';
+  if (typeof json.openapi === 'string' || (json.paths && typeof json.paths === 'object')) return 'openapi';
+  return null;
+}
+
+function mergeImportedRequests(newRequests, meta = {}) {
+  if (!Array.isArray(newRequests) || !newRequests.length) {
+    addAgentMsg('system', 'Nothing to import.');
+    return;
+  }
+  saveActive();
+  let maxId = requests.reduce((m, r) => Math.max(m, Number(r.id) || 0), 0);
+  newRequests.forEach((raw) => {
+    maxId += 1;
+    const normalized = normalizeRequestRecord({ ...raw, id: maxId }, maxId);
+    requests.push(normalized);
+  });
+  idCounter = Math.max(idCounter, maxId + 1);
+  renderSidebar();
+  saveWorkspaceState();
+  const parts = [`Imported ${newRequests.length} request(s).`];
+  if (meta.truncated) parts.push('List was truncated (max operations cap).');
+  if (Array.isArray(meta.warnings) && meta.warnings.length) {
+    parts.push(meta.warnings.join(' '));
+  }
+  addAgentMsg('system', parts.join(' '));
+  setSidebarWindow('requests');
+}
+
+async function runImportSpecFile(file) {
+  const text = await file.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    addAgentMsg('error', 'Import failed: file is not valid JSON.');
+    return;
+  }
+  const kind = detectImportKind(json);
+  if (!kind) {
+    addAgentMsg('error', 'Import failed: expected OpenAPI (3.x or Swagger 2) or Postman v2 collection (info + item).');
+    return;
+  }
+  const path = kind === 'postman' ? BACKEND_ENDPOINTS.importPostman : BACKEND_ENDPOINTS.importOpenapi;
+  const payload = kind === 'postman'
+    ? { collection: json, maxOperations: 120 }
+    : { spec: json, maxOperations: 120 };
+  try {
+    const data = await callBackendJson(path, payload);
+    mergeImportedRequests(data.requests || [], { warnings: data.warnings, truncated: data.truncated });
+  } catch (e) {
+    addAgentMsg('error', `Import failed: ${escHtml(e.message)}`);
+  }
+}
+
+function collectAssertionGoalsFromUi() {
+  const raw = document.getElementById('assertion-gen-goals')?.value || '';
+  return raw.split('\n').map(l => l.trim()).filter(Boolean).slice(0, 12);
+}
+
+function parseExpectedSchemaFromUi() {
+  const raw = document.getElementById('assertion-gen-schema')?.value?.trim();
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error('expected_schema JSON is invalid.');
+  }
+}
+
+async function generateAssertionsFromUi() {
+  if (!lastResponse) {
+    addAgentMsg('system', 'Send a request first so there is a response to assert against.');
+    switchTab('assertions');
+    return;
+  }
+  const mode = document.getElementById('assertion-gen-mode')?.value || 'functional';
+  let expected_schema;
+  try {
+    expected_schema = parseExpectedSchemaFromUi();
+  } catch (e) {
+    addAgentMsg('error', e.message);
+    return;
+  }
+  const goals = collectAssertionGoalsFromUi();
+  const opts = {
+    mode,
+    assertion_goals: goals.length ? goals : undefined
+  };
+  if (expected_schema !== undefined) opts.expected_schema = expected_schema;
+  await autoSuggestAssertions(opts);
 }
 
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach(t => { t.classList.toggle('active', t.dataset.tab === name); });
   document.querySelectorAll('.tab-content').forEach(c => { c.classList.toggle('visible', c.id === 'tab-' + name); });
+  
+  // Render snapshots panel when snapshots tab is shown
+  if (name === 'snapshots') {
+    renderSnapshotsPanel();
+  }
 }
 
 async function autoSuggestAssertions(options = {}) {
@@ -3685,4 +4133,21 @@ function resolveChainTemplate(url) {
   renderAgentMode();
   syncAgentRunControls();
   renderScanProgress();
+
+  const importInput = document.getElementById('import-spec-input');
+  if (importInput) {
+    importInput.addEventListener('change', (e) => {
+      const f = e.target.files[0];
+      if (f) runImportSpecFile(f);
+      e.target.value = '';
+    });
+  }
+  const importBtn = document.getElementById('import-spec-btn');
+  if (importBtn && importInput) {
+    importBtn.addEventListener('click', () => importInput.click());
+  }
+  const assertionGenBtn = document.getElementById('assertion-generate-btn');
+  if (assertionGenBtn) {
+    assertionGenBtn.addEventListener('click', () => generateAssertionsFromUi());
+  }
 })();

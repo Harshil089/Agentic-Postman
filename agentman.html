@@ -138,6 +138,24 @@
           </div>
           <label for="assertion-gen-goals" class="assertions-label">Goals (optional, one per line)</label>
           <textarea id="assertion-gen-goals" class="assertion-gen-textarea" rows="2" placeholder="e.g. reject anonymous access"></textarea>
+          <div class="assertions-toolbar-row">
+            <label for="assertion-gen-strictness" class="assertions-label">Strictness</label>
+            <select id="assertion-gen-strictness" class="assertion-gen-select">
+              <option value="balanced">Balanced</option>
+              <option value="strict">Strict</option>
+              <option value="aggressive">Aggressive</option>
+            </select>
+            <label for="assertion-gen-auth" class="assertions-label">Auth</label>
+            <select id="assertion-gen-auth" class="assertion-gen-select">
+              <option value="auto">Auto-detect</option>
+              <option value="required">Expect auth required</option>
+              <option value="optional">Auth optional</option>
+            </select>
+          </div>
+          <div class="assertions-toolbar-row">
+            <label class="assertions-label"><input type="checkbox" id="assertion-gen-negative" checked /> Include negative checks</label>
+            <label class="assertions-label"><input type="checkbox" id="assertion-gen-timing" /> Include timing checks</label>
+          </div>
           <label for="assertion-gen-schema" class="assertions-label">expected_schema (optional JSON)</label>
           <textarea id="assertion-gen-schema" class="assertion-gen-textarea" rows="3" placeholder='{"type":"object","properties":{"id":{"type":"number"}}}'></textarea>
           <p class="assertions-hint">Uses the last response. Variables: <code>status</code>, <code>json</code>, <code>body</code>, <code>elapsed_ms</code>, <code>elapsed</code>. Timing assertions can be flaky on slow networks.</p>
@@ -194,6 +212,20 @@
             <button class="mode-btn" data-mode="planning" onclick="setAgentMode('planning')">Planning</button>
             <button class="mode-btn" data-mode="ask" onclick="setAgentMode('ask')">Ask</button>
           </div>
+        </div>
+
+        <div class="security-knowledge-panel" id="security-knowledge-panel" style="display:none;">
+          <div class="security-knowledge-head">
+            <div>
+              <div class="security-knowledge-eyebrow">Matched Security Knowledge</div>
+              <div class="security-knowledge-summary" id="security-knowledge-summary">No active security guidance.</div>
+            </div>
+            <div class="security-knowledge-actions">
+              <span class="security-knowledge-count" id="security-knowledge-count">0</span>
+              <button class="security-knowledge-toggle" id="security-knowledge-toggle" type="button" onclick="toggleSecurityKnowledgePanel()">Show</button>
+            </div>
+          </div>
+          <div class="security-knowledge-list" id="security-knowledge-list"></div>
         </div>
 
         <div class="agent-messages" id="agent-messages">
@@ -294,6 +326,7 @@
 </div>
 </div>
 
+<script src="ai-contracts.js"></script>
 <script src="workspace-utils.js"></script>
 <script src="app.js"></script>
 </body>

@@ -10,6 +10,7 @@ Professionalized Postman-like API IDE with an AI agent backend.
 - Template resolution now supports both chain placeholders (for example {{json.user.id}}) and environment placeholders (for example {{baseUrl}}).
 - Outbound request handling in /api/request is hardened with DNS fail-closed behavior, request timeout, and response size limit.
 - Lint, test, and CI workflows are now included for continuous validation.
+- Security prompting now includes a curated CWE-first CVE retrieval layer with endpoint fingerprints, weighted matching, and UI-visible knowledge matches for auth, authorization, injection, session, upload, SSRF, disclosure, and workflow abuse patterns.
 
 ## Architecture
 
@@ -18,6 +19,8 @@ Professionalized Postman-like API IDE with an AI agent backend.
 - `app.js`: frontend state + interactions + calls to backend APIs
 - `workspace-utils.js`: shared pure utilities for request preview, diffing, and template resolution
 - `server.js`: Express server, static hosting, secure multi-provider AI integration
+- `security-cve-dataset.json`: curated CWE-first CVE family knowledge with endpoint fingerprints and CVE examples
+- `security-knowledge.js`: retrieval and weighted scoring layer for endpoint-relevant security knowledge
 - `model-capabilities.json`: model reliability and capability registry used by dynamic routing
 - `test/server.request.test.js`: backend route behavior tests for /api/request
 - `test/workspace-utils.test.js`: utility tests for preview, diffing, and template resolution
@@ -50,6 +53,8 @@ Professionalized Postman-like API IDE with an AI agent backend.
   - Default headers applied when a request-level header is missing
 - Chain template support in URLs using prior response JSON values.
 - Security scan orchestration with guarded execution paths for mutating requests.
+- CVE-informed security prompting that retrieves endpoint-relevant weakness families, safer test objectives, and matched CVE examples before the model generates probes.
+- Security chat now surfaces the matched knowledge records so you can see what informed each generated probe set.
 
 ## Setup
 

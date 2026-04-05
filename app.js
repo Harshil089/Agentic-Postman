@@ -76,6 +76,8 @@ let chatGoal = '';
 let conversationHistory = [];
 let securityTestHistory = [];
 let securityThreatLevel = 'none';
+let matchedSecurityKnowledge = [];
+let securityKnowledgeExpanded = false;
 let activeSidebarWindow = 'requests';
 let errorLogEntries = [];
 let structuredDiagnosticsEntries = [];
@@ -149,6 +151,9 @@ const workspaceUtils = (typeof window !== 'undefined' && window.AgentmanWorkspac
       resolveChainTemplate: (url) => url,
       resolveVariableTemplate: (text) => text
     };
+const aiContracts = (typeof window !== 'undefined' && window.AgentmanAiContracts)
+  ? window.AgentmanAiContracts
+  : null;
 
 function createDefaultEnvironment() {
   return {
@@ -169,6 +174,7 @@ function cloneSerializable(value) {
 }
 
 function sanitizeKeyValueEntries(entries) {
+  if (aiContracts?.normalizeKVEntries) return aiContracts.normalizeKVEntries(entries, { maxItems: 64 });
   return Array.isArray(entries)
     ? entries
         .map(entry => ({
@@ -192,6 +198,7 @@ function sanitizeAssertionEntries(assertions) {
 }
 
 function normalizeImportMeta(raw) {
+  if (aiContracts?.normalizeImportMeta) return aiContracts.normalizeImportMeta(raw);
   if (!raw || typeof raw !== 'object') return null;
   const source = typeof raw.source === 'string' ? raw.source : '';
   const param_candidates = Array.isArray(raw.param_candidates)
@@ -1531,7 +1538,10 @@ function startNewChat() {
   conversationHistory = [];
   securityTestHistory = [];
   securityThreatLevel = 'none';
+  matchedSecurityKnowledge = [];
+  securityKnowledgeExpanded = false;
   resetScanProgress('No active scan');
+  renderSecurityKnowledgePanel();
   renderWelcomeMessage();
   loadComponentIntegrationPrompt();
   addAgentMsg('system', `Started new chat context (session ${chatSessionId}).`);
@@ -1846,6 +1856,7 @@ function getProviderModel(provider, taskType = 'security') {
 
 function buildSecurityContext(req, resp, userMsg) {
   return {
+    current_mode: agentMode,
     target_url: getBaseTargetUrl(req.url),
     scan_profile: SCAN_PROFILE_VALUES.has(securityScanProfile) ? securityScanProfile : 'standard',
     current_request: {
@@ -1853,13 +1864,15 @@ function buildSecurityContext(req, resp, userMsg) {
       url: req.url,
       headers: req.headers,
       params: req.params,
-      body: req.body
+      body: req.body,
+      importMeta: req.importMeta || null
     },
     last_response: resp && typeof resp.status === 'number'
       ? {
           status: resp.status,
           elapsed_ms: Number(resp.elapsed || 0),
-          body_preview: (resp.text || '').substring(0, 1200)
+          body_preview: (resp.text || '').substring(0, 1200),
+          headers: resp.headers || {}
         }
       : null,
     auth_context: deriveAuthContext(req.headers),
@@ -1887,6 +1900,9 @@ function parseSecurityPayload(raw) {
 }
 
 function normalizeSecurityAction(action) {
+  if (aiContracts?.validateSecurityAction) {
+    return aiContracts.validateSecurityAction(action, 0).value || null;
+  }
   if (!action || typeof action !== 'object' || typeof action.type !== 'string') return null;
   const allowedMethods = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -1964,8 +1980,14 @@ function normalizeSecurityAction(action) {
     const param_matrix = Array.isArray(action.param_matrix)
       ? action.param_matrix
         .map(entry => ({
-          param: typeof entry?.param === 'string' ? entry.param.trim() : '',
-          location: ['query', 'body', 'header'].includes(String(entry?.location)) ? entry.location : 'query'
+          param: typeof entry?.param === 'string'
+            ? entry.param.trim()
+            : typeof entry?.name === 'string'
+              ? entry.name.trim()
+              : typeof entry?.path === 'string'
+                ? entry.path.trim()
+                : '',
+          location: ['query', 'body', 'header', 'path'].includes(String(entry?.location)) ? entry.location : 'query'
         }))
         .filter(entry => entry.param)
       : [];
@@ -2018,7 +2040,7 @@ function renderSecurityFindings(findings, threatLevel) {
 function renderScanPlan(action) {
   const methodCoverage = Array.isArray(action.method_coverage) ? action.method_coverage.join(', ') : '';
   const matrixLine = Array.isArray(action.param_matrix) && action.param_matrix.length
-    ? `<br>Param matrix: ${escHtml(action.param_matrix.map(m => `${m.param} (${m.location})`).join(', '))}`
+    ? `<br>Param matrix: ${escHtml(action.param_matrix.map(m => `${m.param || m.name || m.path} (${m.location})`).join(', '))}`
     : '';
   const steps = Array.isArray(action.steps)
     ? action.steps.map(step => {
@@ -2108,8 +2130,8 @@ function resolveProbeParamKey(vector, planStep, scanPlan, candidates) {
   const preferLoc = vector === 'NoSQLi' || vector === 'MassAssignment' || vector === 'SSRF' || vector === 'XXE'
     ? 'body'
     : 'query';
-  const matrixHit = matrix.find(m => m.param && (m.location === preferLoc || !m.location));
-  if (matrixHit && matrixHit.param) return matrixHit.param;
+  const matrixHit = matrix.find(m => (m.param || m.name || m.path) && (m.location === preferLoc || !m.location));
+  if (matrixHit && (matrixHit.param || matrixHit.name || matrixHit.path)) return matrixHit.param || matrixHit.name || matrixHit.path;
 
   const vectorDefaults = {
     IDOR: ['id', 'userId', 'user_id', 'resourceId'],
@@ -2577,6 +2599,7 @@ async function generateProbeForScanStep(scanPlan, planStep) {
     throw lastRateError;
   }
 
+  applySecurityDiagnostics(raw?.diagnostics);
   const parsed = parseSecurityPayload(raw);
   updateThreatLevel(parsed.threat_level);
   renderSecurityFindings(parsed.findings, securityThreatLevel);
@@ -3016,6 +3039,9 @@ function evaluateAssertionAst(node, scope) {
 }
 
 function evaluateAssertionExpression(expression, scope) {
+  if (aiContracts?.evaluateAssertionExpression) {
+    return aiContracts.evaluateAssertionExpression(expression, scope);
+  }
   return evaluateAssertionAst(parseAssertionExpression(expression), scope);
 }
 
@@ -3135,6 +3161,15 @@ function collectAssertionGoalsFromUi() {
   return raw.split('\n').map(l => l.trim()).filter(Boolean).slice(0, 12);
 }
 
+function collectAssertionPreferencesFromUi() {
+  return {
+    strictness: document.getElementById('assertion-gen-strictness')?.value || 'balanced',
+    auth_expectation: document.getElementById('assertion-gen-auth')?.value || 'auto',
+    include_negative_checks: Boolean(document.getElementById('assertion-gen-negative')?.checked),
+    include_timing_checks: Boolean(document.getElementById('assertion-gen-timing')?.checked)
+  };
+}
+
 function parseExpectedSchemaFromUi() {
   const raw = document.getElementById('assertion-gen-schema')?.value?.trim();
   if (!raw) return undefined;
@@ -3160,9 +3195,11 @@ async function generateAssertionsFromUi() {
     return;
   }
   const goals = collectAssertionGoalsFromUi();
+  const preferences = collectAssertionPreferencesFromUi();
   const opts = {
     mode,
-    assertion_goals: goals.length ? goals : undefined
+    assertion_goals: goals.length ? goals : undefined,
+    preferences
   };
   if (expected_schema !== undefined) opts.expected_schema = expected_schema;
   await autoSuggestAssertions(opts);
@@ -3180,7 +3217,7 @@ function switchTab(name) {
 
 async function autoSuggestAssertions(options = {}) {
   if (!lastResponse) return;
-  const preview = lastResponse.text?.substring(0, 600);
+  const preview = lastResponse.text?.substring(0, 1200);
   try {
     const preferredProvider = selectedModelProvider === MODEL_PROVIDERS.gemini
       ? MODEL_PROVIDERS.openrouter
@@ -3190,15 +3227,35 @@ async function autoSuggestAssertions(options = {}) {
       : preferredProvider === MODEL_PROVIDERS.gemini
         ? GEMINI_MODELS.default
         : OPENROUTER_MODELS.default;
+    const activeRequest = getActive();
+    let parsedJson = null;
+    try {
+      parsedJson = JSON.parse(lastResponse.text || '');
+    } catch {}
     const payload = {
-      status: lastResponse.status,
+      current_request: activeRequest ? {
+        method: activeRequest.method,
+        url: activeRequest.url,
+        headers: activeRequest.headers,
+        params: activeRequest.params,
+        body: activeRequest.body,
+        importMeta: activeRequest.importMeta || null
+      } : null,
+      current_assertions: activeRequest ? (activeRequest.assertions || []).map(entry => entry.expr) : [],
+      response_status: lastResponse.status,
+      response_headers: lastResponse.headers || {},
+      elapsed_ms: Number(lastResponse.elapsed ?? lastResponse.elapsed_ms ?? 0),
       body_preview: preview,
+      response_json_summary: parsedJson && typeof parsedJson === 'object'
+        ? JSON.stringify(parsedJson).slice(0, 2000)
+        : '',
       provider: preferredProvider,
       model: preferredModel,
       mode: typeof options.mode === 'string' ? options.mode : 'functional'
     };
     if (Array.isArray(options.assertion_goals)) payload.assertion_goals = options.assertion_goals;
     if (options.expected_schema !== undefined) payload.expected_schema = options.expected_schema;
+    if (options.preferences && typeof options.preferences === 'object') payload.preferences = options.preferences;
     const parsed = await callBackendJson(BACKEND_ENDPOINTS.assertions, payload);
     const arr = Array.isArray(parsed?.assertions) ? parsed.assertions : [];
     if (!arr.length) return;
@@ -3215,6 +3272,13 @@ async function autoSuggestAssertions(options = {}) {
 }
 
 function buildUserContext(req, resp, userMsg) {
+  let responseJsonSummary = '';
+  try {
+    const parsed = JSON.parse(resp?.text || '');
+    if (parsed && typeof parsed === 'object') {
+      responseJsonSummary = JSON.stringify(parsed).slice(0, 1600);
+    }
+  } catch {}
   return JSON.stringify({
     current_mode: agentMode,
     chat_session_id: chatSessionId,
@@ -3225,12 +3289,15 @@ function buildUserContext(req, resp, userMsg) {
       url: req.url,
       headers: req.headers,
       params: req.params,
-      body: req.body
+      body: req.body,
+      importMeta: req.importMeta || null
     },
     last_response: resp ? {
       status: resp.status,
       elapsed_ms: resp.elapsed,
-      body_preview: (resp.text || '').substring(0, 800)
+      body_preview: (resp.text || '').substring(0, 1200),
+      headers: resp.headers || {},
+      json_summary: responseJsonSummary
     } : null,
     current_assertions: (req.assertions || []).map(a => a.expr),
     user_message: userMsg
@@ -3269,6 +3336,7 @@ function parseAgentPayload(raw) {
 }
 
 function normalizeKVList(value) {
+  if (aiContracts?.normalizeKVEntries) return aiContracts.normalizeKVEntries(value, { maxItems: 64 });
   if (!Array.isArray(value)) return [];
   return value
     .filter(item => item && typeof item.k === 'string')
@@ -3276,6 +3344,9 @@ function normalizeKVList(value) {
 }
 
 function validateAndNormalizeAction(action) {
+  if (aiContracts?.validateAgentAction) {
+    return aiContracts.validateAgentAction(action, 0).value || null;
+  }
   if (!action || typeof action !== 'object' || typeof action.type !== 'string') return null;
   const allowedMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
 
@@ -3332,6 +3403,9 @@ function validateAndNormalizeAction(action) {
 }
 
 function normalizeAgentActionsStrict(actions) {
+  if (aiContracts?.normalizeAgentActionsStrict) {
+    return aiContracts.normalizeAgentActionsStrict(actions);
+  }
   const source = Array.isArray(actions) ? actions : [];
   const normalized = [];
   const invalidIndexes = [];
@@ -3350,6 +3424,9 @@ function normalizeAgentActionsStrict(actions) {
 }
 
 function normalizeSecurityActionsStrict(actions) {
+  if (aiContracts?.normalizeSecurityActionsStrict) {
+    return aiContracts.normalizeSecurityActionsStrict(actions);
+  }
   const source = Array.isArray(actions) ? actions : [];
   const normalized = [];
   const invalidIndexes = [];
@@ -3498,6 +3575,84 @@ function renderDebugInfoAction(action) {
   addAgentMsg('agent', dbgText, []);
 }
 
+function renderSecurityKnowledgeList(items) {
+  const list = Array.isArray(items) ? items.filter(item => typeof item === 'string' && item.trim()) : [];
+  if (!list.length) return '';
+  return `<ul class="security-knowledge-bullets">${list.map(item => `<li>${escHtml(item)}</li>`).join('')}</ul>`;
+}
+
+function renderSecurityKnowledgePanel(records = matchedSecurityKnowledge) {
+  const panel = document.getElementById('security-knowledge-panel');
+  const summaryEl = document.getElementById('security-knowledge-summary');
+  const countEl = document.getElementById('security-knowledge-count');
+  const listEl = document.getElementById('security-knowledge-list');
+  const toggleEl = document.getElementById('security-knowledge-toggle');
+  if (!panel || !summaryEl || !countEl || !listEl || !toggleEl) return;
+
+  const list = Array.isArray(records) ? records.filter(Boolean) : [];
+  if (!list.length) {
+    panel.style.display = 'none';
+    summaryEl.textContent = 'No active security guidance.';
+    countEl.textContent = '0';
+    toggleEl.textContent = 'Show';
+    toggleEl.setAttribute('aria-expanded', 'false');
+    listEl.innerHTML = '';
+    return;
+  }
+
+  const safeOnlyCount = list.filter(record => record?.safety_profile === 'safe-detection').length;
+  panel.style.display = 'block';
+  panel.classList.toggle('collapsed', !securityKnowledgeExpanded);
+  summaryEl.textContent = `${list.length} matched famil${list.length === 1 ? 'y' : 'ies'} · ${safeOnlyCount} safe-only · ${Math.max(0, list.length - safeOnlyCount)} mixed-risk`;
+  countEl.textContent = String(list.length);
+  toggleEl.textContent = securityKnowledgeExpanded ? 'Hide' : 'Show';
+  toggleEl.setAttribute('aria-expanded', securityKnowledgeExpanded ? 'true' : 'false');
+  listEl.innerHTML = list.map(record => {
+    const cveExamples = Array.isArray(record.cve_examples) && record.cve_examples.length
+      ? record.cve_examples
+        .map(example => `${example?.id || 'CVE'}${example?.title ? `: ${example.title}` : ''}`)
+        .filter(Boolean)
+      : [];
+    const sections = [
+      ['Matched terms', Array.isArray(record.matched_terms) ? record.matched_terms : []],
+      ['Safe detection probes', Array.isArray(record.safe_detection_templates) ? record.safe_detection_templates : []],
+      ['Mutation-risk probes', Array.isArray(record.mutation_risk_templates) ? record.mutation_risk_templates : []],
+      ['Negative assertions', Array.isArray(record.negative_assertion_templates) ? record.negative_assertion_templates : []],
+      ['Safe objectives', Array.isArray(record.safe_test_objectives) ? record.safe_test_objectives : []],
+      ['CVE examples', cveExamples]
+    ]
+      .map(([label, items]) => {
+        const html = renderSecurityKnowledgeList(items);
+        return html ? `<div class="security-knowledge-section"><div class="security-knowledge-label">${escHtml(label)}</div>${html}</div>` : '';
+      })
+      .join('');
+
+    return `<div class="security-knowledge-item">
+      <div class="security-knowledge-item-head">
+        <div>
+          <div class="security-knowledge-title">${escHtml(record.title || record.family || 'Knowledge match')}</div>
+          <div class="security-knowledge-meta">${escHtml(record.cwe || 'n/a')} · ${escHtml(record.owasp_api_label || 'n/a')}</div>
+        </div>
+        <div class="security-knowledge-profile">${escHtml(record.safety_profile || 'safe-detection')}</div>
+      </div>
+      ${sections}
+    </div>`;
+  }).join('');
+}
+
+function applySecurityDiagnostics(diagnostics) {
+  const records = Array.isArray(diagnostics?.matched_cve_records) ? diagnostics.matched_cve_records : [];
+  matchedSecurityKnowledge = records.filter(Boolean);
+  securityKnowledgeExpanded = false;
+  renderSecurityKnowledgePanel();
+}
+
+function toggleSecurityKnowledgePanel() {
+  if (!matchedSecurityKnowledge.length) return;
+  securityKnowledgeExpanded = !securityKnowledgeExpanded;
+  renderSecurityKnowledgePanel();
+}
+
 function buildAgentContinuationMessage(baseMessage, step) {
   if (step === 0) return baseMessage;
   return `${baseMessage}\n\nContinue autonomously from the latest response and execute the next best step. If the task is complete, return actions: [] and put a final one-paragraph summary in message starting with "Conclusion:".`;
@@ -3545,6 +3700,7 @@ async function runSecurityAgent(initialUserMsg) {
     if (diagnosticsLabel) {
       addAgentMsg('system', diagnosticsLabel, [], { track: false });
     }
+    applySecurityDiagnostics(raw?.diagnostics);
 
     const parsed = parseSecurityPayload(raw);
     const actionBatch = normalizeSecurityActionsStrict(parsed.actions || []);
@@ -3653,6 +3809,8 @@ async function runSecurityAgent(initialUserMsg) {
     }
     if (agentMode === 'planning' && normalizedActions.length) {
       addAgentMsg('system', 'Planning mode produced a security test plan and suggested actions.');
+    } else if (agentMode === 'planning' && !normalizedActions.length) {
+      addAgentMsg('error', 'Planning mode did not receive a security scan plan. Retry the request after the backend repair pass completes.');
     }
 
     addAgentMsg('agent', escHtml(parsed.message || 'Security check complete.'), chips);
@@ -3883,6 +4041,7 @@ async function callSecurityAgent(targetUrl, currentRequest, lastResponseData, au
   return callBackendJson(BACKEND_ENDPOINTS.securityAgent, {
     provider,
     context: {
+      current_mode: agentMode,
       target_url: targetUrl,
       scan_profile: SCAN_PROFILE_VALUES.has(securityScanProfile) ? securityScanProfile : 'standard',
       current_request: currentRequest,

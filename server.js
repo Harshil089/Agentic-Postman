@@ -6,6 +6,8 @@ const express = require('express');
 const dotenv = require('dotenv');
 const workspaceUtils = require('./workspace-utils');
 const importSpec = require('./import-spec');
+const aiContracts = require('./ai-contracts');
+const securityKnowledge = require('./security-knowledge');
 
 dotenv.config();
 
@@ -434,6 +436,47 @@ function buildAdaptiveTokenPlan(baseTokens, fallbackTokens, stats) {
   return unique;
 }
 
+function extractStructuredTextPayload(content) {
+  if (typeof content === 'string') {
+    return content.trim();
+  }
+
+  if (Array.isArray(content)) {
+    const text = content
+      .map(part => extractStructuredTextPayload(part))
+      .filter(Boolean)
+      .join('');
+    return text.trim();
+  }
+
+  if (content && typeof content === 'object') {
+    if (typeof content.text === 'string' && content.text.trim()) {
+      return content.text.trim();
+    }
+    if (typeof content.output_text === 'string' && content.output_text.trim()) {
+      return content.output_text.trim();
+    }
+    if (typeof content.content === 'string' && content.content.trim()) {
+      return content.content.trim();
+    }
+    if (Array.isArray(content.content)) {
+      const nested = extractStructuredTextPayload(content.content);
+      if (nested) return nested;
+    }
+    if (content.type === 'text' && typeof content.value === 'string' && content.value.trim()) {
+      return content.value.trim();
+    }
+    try {
+      const json = JSON.stringify(content);
+      return json && json !== '{}' ? json : '';
+    } catch {
+      return '';
+    }
+  }
+
+  return '';
+}
+
 const AGENT_MASTER_PROMPT = `You are AgentMan — an agentic backend engine for a Postman-like API IDE.
 You receive structured context about the user's current HTTP request and last response,
 then return a strict JSON action payload that the IDE frontend executes directly.
@@ -443,8 +486,8 @@ CONTEXT YOU WILL RECEIVE (per turn)
 - chat_session_id: number
 - chat_goal: string
 - conversation_history: array of { role, text }
-- current_request: { method, url, headers[], params[], body }
-- last_response:   { status, elapsed_ms, body_preview (first 800 chars) } | null
+- current_request: { method, url, headers[], params[], body, importMeta? }
+- last_response:   { status, elapsed_ms, headers?, body_preview, json_summary? } | null
 - current_assertions: string[] of JS expressions | []
 - user_message: plain English instruction
 
@@ -481,6 +524,12 @@ Each action MUST be one of the following typed objects:
   ]
 }
 Assertions are JS expressions. Available variables: status (number), json (parsed object or null), body (raw string).
+Supported syntax is intentionally limited to safe expressions:
+- comparisons: ===, !==, >, <, >=, <=
+- boolean logic: &&, ||
+- unary: !, typeof
+- access: json.field, json.items[0], body, status, elapsed_ms, elapsed
+- calls: Array.isArray(x), body.includes("..."), body.startsWith("..."), body.endsWith("..."), obj.hasOwnProperty("field")
 
 3. CHAIN_REQUEST
 {
@@ -513,16 +562,20 @@ patch is optional — include it only when the fix is a direct request mutation.
 BEHAVIORAL RULES
 1. NEVER return markdown, prose, or code fences. Raw JSON only.
 2. For public demo APIs default to: jsonplaceholder.typicode.com, reqres.in, httpbin.org.
-3. For assertion generation: always produce 4–6 expressions. Cover status code,
-   response shape (Array.isArray, typeof), key field existence, and one value check.
+3. When current_request.importMeta.param_descriptors exists, prefer those descriptors over guessing parameter names.
+4. When building requests, preserve existing relevant headers/params/body fields unless the user clearly wants a replacement.
+5. For assertion generation: produce non-duplicated, specific expressions tied to the observed response.
+   Cover status, shape/field checks, and at least one negative guard when applicable.
+   Do not emit tautologies such as status === status or constants like true.
+6. If last_response.json_summary or body_preview reveals actual field names, prefer those exact fields over generic "id"/"name".
 4. For chaining: inspect last_response body_preview to infer real field names.
    Prefer json.id, json.data.id, json.results[0].id in that priority order.
-5. For debugging: check in order — status code semantics, missing auth headers,
+7. For debugging: check in order — status code semantics, missing auth headers,
    wrong Content-Type, malformed JSON body, CORS (if browser error), URL typos.
-6. If user_message is ambiguous, prefer set_request over asking a clarifying question.
+8. If user_message is ambiguous, prefer set_request over asking a clarifying question.
    Make a reasonable assumption and state it in "message".
-7. Actions may be combined in one response. Example: set_request + set_assertions together.
-8. Never include secrets or real credentials. Use placeholder strings like <your-token>.`;
+9. Actions may be combined in one response. Example: set_request + set_assertions together.
+10. Never include secrets or real credentials. Use placeholder strings like <your-token>.`;
 
 const MODE_RULES_PROMPT = `MODE-SPECIFIC BEHAVIOR
 - If current_mode is "ask": focus on explanation, debugging analysis, or guidance. Return actions as [] unless the user explicitly asks to build/modify a request.
@@ -555,6 +608,7 @@ PATCH -> Partial update abuse, role/permission field tampering, BOLA
 DELETE -> Unauthorized deletion, IDOR, cascade delete abuse, soft-delete bypass
 
 CONTEXT YOU RECEIVE PER TURN
+- current_mode      : "planning" | "ask" | "agent"
 - target_url        : base URL under test
 - current_request   : { method, url, headers[], params[], body }
 - last_response     : { status, elapsed_ms, body_preview } | null
@@ -562,6 +616,8 @@ CONTEXT YOU RECEIVE PER TURN
 - test_history      : [ { method, url, status, finding } ]
 - user_instruction  : plain English command from the tester
 - param_candidates  : string[] — query keys, body keys, and param-table keys from current_request; prefer these for probes/fuzz_list targets instead of guessing "id" only
+- current_request.param_descriptors : array of { name, path, location, type, required, source, example?, default? }
+- matched_cve_records : curated CVE/CWE guidance with signal_patterns, safe_test_objectives, safe_detection_templates, mutation_risk_templates, negative_assertion_templates, and prompt_hints relevant to this endpoint
 - scan_profile      : "quick" | "standard" | "deep" — quick=fewer probes; standard=balanced; deep=more fuzz_list rows and param rotation
 
 OUTPUT CONTRACT - RAW JSON ONLY, ZERO MARKDOWN
@@ -723,20 +779,30 @@ AUTH BYPASS HEADERS:
   Authorization: Bearer undefined
   Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJyb2xlIjoiYWRtaW4ifQ.
 
+MODE RULES
+- If current_mode is "ask": explain likely risks or findings, but do not emit executable actions unless the user explicitly asks for a concrete probe.
+- If current_mode is "planning": broad requests like "scan", "audit", "test all", or "full check" should return scan_plan first, then optional safe supporting actions.
+- If current_mode is "agent": prefer returning one or more directly executable probes or fuzz_list actions. Only return scan_plan when the user explicitly asks for a plan, or when there is not enough concrete request context to generate a responsible first probe.
+
 BEHAVIORAL RULES
 1. Raw JSON only. No markdown, no prose, no code fences.
 2. This is an API IDE and learning tool. Do not refuse a scan or plan solely because the target is a public or production domain.
-3. Prefer planning and non-destructive probes first. When the request is broad ("scan", "audit", "full check"), return scan_plan first and then the safest useful next actions.
+3. Prefer non-destructive probes first. In current_mode "planning", broad requests ("scan", "audit", "full check") should return scan_plan first. In current_mode "agent", broad requests should start with the safest concrete executable probe when enough context exists.
 4. One vector per probe action.
 5. evidence in findings MUST quote actual response content - never inferred.
 6. If last_response.status === 500 -> always generate a debug_info action.
 7. If last_response body contains "password", "secret", "token", "key" in plaintext -> auto-elevate finding to HIGH and include in findings array.
 8. For IDOR probes, always test: id-1, id+1, id*2, id=0, id=99999, id=null, id=-1.
 9. For auth tests, always test: no header, wrong scheme, expired token, alg:none JWT, and role-escalated JWT payload.
-10. scan_plan is always the first action when user_instruction contains "scan", "audit", "test all", or "full check".
+10. scan_plan is first only in current_mode "planning", or when the user explicitly asks for a plan.
 11. threat_level escalation is permanent within a session - it never decreases once raised.
 12. When scan_profile is "deep", include param_matrix covering param_candidates where relevant, and add fuzz_list actions for SQLi/NoSQLi on distinct params when safe.
-13. Map findings to OWASP API Top 10 (2023) in owasp_api_label when applicable (API1 Broken Object Level Authorization … API10 Unsafe Consumption of APIs).`;
+13. Prefer current_request.param_descriptors and import_meta fields over invented parameter names.
+14. Do not emit empty scan_plan steps, empty fuzz_list target_param values, or vectors outside the allowed list.
+15. Map findings to OWASP API Top 10 (2023) in owasp_api_label when applicable (API1 Broken Object Level Authorization … API10 Unsafe Consumption of APIs).
+16. When matched_cve_records are present, use them to prioritize vulnerability families, evidence patterns, and safe test objectives for the current endpoint.
+17. Prefer matched_cve_records.safe_detection_templates for the first executable probes; only escalate toward mutation_risk_templates when the user explicitly asks for higher-risk testing or when safe probes are exhausted.
+18. When emitting set_assertions, reuse matched_cve_records.negative_assertion_templates where they fit the observed response.`;
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(__dirname));
@@ -1038,17 +1104,8 @@ async function openRouterGenerateJson({ model, systemPrompt, userContent, temper
   }
 
   const content = data?.choices?.[0]?.message?.content;
-  if (typeof content === 'string' && content.trim()) return content;
-  if (Array.isArray(content)) {
-    const text = content
-      .map(part => {
-        if (typeof part === 'string') return part;
-        if (part && typeof part.text === 'string') return part.text;
-        return '';
-      })
-      .join('');
-    if (text.trim()) return text;
-  }
+  const text = extractStructuredTextPayload(content);
+  if (text) return text;
 
   const err = new Error('OpenRouter API returned an unexpected content shape.');
   err.status = 502;
@@ -1268,17 +1325,8 @@ async function groqGenerateJson({ model, systemPrompt, userContent, temperature 
   }
 
   const content = data?.choices?.[0]?.message?.content;
-  if (typeof content === 'string' && content.trim()) return content;
-  if (Array.isArray(content)) {
-    const text = content
-      .map(part => {
-        if (typeof part === 'string') return part;
-        if (part && typeof part.text === 'string') return part.text;
-        return '';
-      })
-      .join('');
-    if (text.trim()) return text;
-  }
+  const text = extractStructuredTextPayload(content);
+  if (text) return text;
 
   const err = new Error('Groq API returned an unexpected content shape.');
   err.status = 502;
@@ -1348,6 +1396,188 @@ function compactHeaderLikeList(list, maxItems = 8, maxValueLength = 120) {
     .filter(item => item.k);
 }
 
+function compactParamDescriptors(list, maxItems = 20, maxValueLength = 80) {
+  const source = Array.isArray(list) ? list : [];
+  return source
+    .slice(0, maxItems)
+    .map(entry => ({
+      name: truncateText(entry?.name, 60),
+      path: truncateText(entry?.path, 120),
+      location: truncateText(entry?.location, 16),
+      type: truncateText(entry?.type, 24),
+      required: Boolean(entry?.required),
+      source: truncateText(entry?.source, 40),
+      ...(entry?.example !== undefined ? { example: truncateText(typeof entry.example === 'string' ? entry.example : JSON.stringify(entry.example), maxValueLength) } : {}),
+      ...(entry?.default !== undefined ? { default: truncateText(typeof entry.default === 'string' ? entry.default : JSON.stringify(entry.default), maxValueLength) } : {})
+    }))
+    .filter(entry => entry.name || entry.path);
+}
+
+function compactImportMeta(meta, provider, deep = false) {
+  const normalized = aiContracts.normalizeImportMeta(meta);
+  if (!normalized) return null;
+  const descriptorLimit = provider === MODEL_PROVIDERS.groq ? (deep ? 18 : 10) : deep ? 30 : 18;
+  return {
+    source: truncateText(normalized.source, 24),
+    param_candidates: Array.isArray(normalized.param_candidates)
+      ? normalized.param_candidates.slice(0, provider === MODEL_PROVIDERS.groq ? (deep ? 20 : 12) : deep ? 28 : 20)
+      : [],
+    param_descriptors: compactParamDescriptors(normalized.param_descriptors, descriptorLimit, provider === MODEL_PROVIDERS.groq ? 60 : 90)
+  };
+}
+
+function tryParseJson(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function looksLikeTautology(expression) {
+  const normalized = String(expression || '').replace(/\s+/g, '');
+  return normalized === 'true'
+    || normalized === 'false'
+    || normalized === 'status===status'
+    || normalized === 'body===body'
+    || normalized === 'json===json'
+    || normalized === 'elapsed===elapsed'
+    || normalized === 'elapsed_ms===elapsed_ms';
+}
+
+function buildKnownJsonPaths(value, prefix = 'json', seen = new Set(), depth = 0, maxDepth = 3) {
+  if (depth > maxDepth || value == null) return seen;
+  if (Array.isArray(value)) {
+    seen.add(prefix);
+    if (value.length) buildKnownJsonPaths(value[0], `${prefix}[0]`, seen, depth + 1, maxDepth);
+    return seen;
+  }
+  if (typeof value === 'object') {
+    seen.add(prefix);
+    Object.entries(value).slice(0, 40).forEach(([key, child]) => {
+      const path = `${prefix}.${key}`;
+      seen.add(path);
+      buildKnownJsonPaths(child, path, seen, depth + 1, maxDepth);
+    });
+    return seen;
+  }
+  seen.add(prefix);
+  return seen;
+}
+
+function buildKnownSchemaPaths(schema, prefix = 'json', seen = new Set(), depth = 0, maxDepth = 4) {
+  if (!schema || typeof schema !== 'object' || depth > maxDepth) return seen;
+  seen.add(prefix);
+  if (schema.properties && typeof schema.properties === 'object') {
+    Object.entries(schema.properties).forEach(([key, child]) => {
+      const path = `${prefix}.${key}`;
+      seen.add(path);
+      buildKnownSchemaPaths(child, path, seen, depth + 1, maxDepth);
+    });
+  }
+  if (schema.items && typeof schema.items === 'object') {
+    const itemPath = `${prefix}[0]`;
+    seen.add(itemPath);
+    buildKnownSchemaPaths(schema.items, itemPath, seen, depth + 1, maxDepth);
+  }
+  return seen;
+}
+
+function categorizeAssertionQuality(expression, metadata) {
+  const text = String(expression || '');
+  const categories = new Set(metadata.categories || []);
+  if (/\b401\b|\b403\b|unauthorized|forbidden/i.test(text)) categories.add('auth');
+  if (/\btypeof\b|Array\.isArray|hasOwnProperty/.test(text)) categories.add('shape');
+  if (/!?\s*body\.(includes|startsWith|endsWith)/.test(text)) categories.add('negative');
+  if (/json\./.test(text)) categories.add('field');
+  if (/\belapsed(_ms)?\b/.test(text)) categories.add('timing');
+  if (/\bstatus\b/.test(text)) categories.add('status');
+  return [...categories];
+}
+
+function validateGeneratedAssertions(assertions, options = {}) {
+  const mode = options.mode || 'functional';
+  const parsedJson = options.parsedJson || null;
+  const expectedSchema = options.expectedSchema || null;
+  const errors = [];
+  const seen = new Set();
+  const coverage = new Set();
+  const knownPaths = new Set([
+    ...buildKnownJsonPaths(parsedJson || null),
+    ...buildKnownSchemaPaths(expectedSchema || null)
+  ]);
+
+  assertions.forEach((expression, index) => {
+    const normalized = String(expression || '').trim();
+    const dedupeKey = normalized.replace(/\s+/g, ' ');
+    if (seen.has(dedupeKey)) {
+      errors.push(`assertions[${index}] duplicates another assertion.`);
+      return;
+    }
+    seen.add(dedupeKey);
+    if (looksLikeTautology(normalized)) {
+      errors.push(`assertions[${index}] is a tautology or constant expression.`);
+      return;
+    }
+    let metadata;
+    try {
+      metadata = aiContracts.collectAssertionMetadata(normalized);
+    } catch (error) {
+      errors.push(`assertions[${index}] uses unsupported syntax: ${error.message}`);
+      return;
+    }
+    const categories = categorizeAssertionQuality(normalized, metadata);
+    categories.forEach(category => coverage.add(category));
+    metadata.references.forEach(reference => {
+      if (!reference) return;
+      const terminal = reference.split('.').pop();
+      if (['includes', 'startsWith', 'endsWith', 'hasOwnProperty'].includes(terminal)) return;
+      const candidate = reference.startsWith('json') ? reference : `json.${reference}`;
+      const arrayCandidate = candidate.replace(/\.\d+\b/g, '[0]');
+      if (knownPaths.size > 0 && !knownPaths.has(candidate) && !knownPaths.has(arrayCandidate)) {
+        errors.push(`assertions[${index}] references unknown field path "${reference}".`);
+      }
+    });
+  });
+
+  if (mode === 'security') {
+    if (!coverage.has('status') && !coverage.has('auth')) {
+      errors.push('security assertions must cover status or auth expectations.');
+    }
+    if (!coverage.has('negative')) {
+      errors.push('security assertions must include at least one negative content check.');
+    }
+  } else if (mode === 'contract') {
+    if (!coverage.has('shape')) {
+      errors.push('contract assertions must validate response shape or types.');
+    }
+    if (!coverage.has('field')) {
+      errors.push('contract assertions must reference response fields.');
+    }
+  } else {
+    if (!coverage.has('status')) {
+      errors.push('functional assertions must include a status check.');
+    }
+    if (!coverage.has('field') && !coverage.has('shape')) {
+      errors.push('functional assertions must validate response shape or fields.');
+    }
+    if (!coverage.has('negative')) {
+      errors.push('functional assertions must include at least one negative guard.');
+    }
+  }
+
+  if (options.preferences?.include_timing_checks && !coverage.has('timing')) {
+    errors.push('timing checks were requested but no timing assertion was generated.');
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    coverage: [...coverage]
+  };
+}
+
 const SCAN_PROFILES = new Set(['quick', 'standard', 'deep']);
 
 function normalizeScanProfile(raw) {
@@ -1359,19 +1589,32 @@ function compactSecurityContext(context, provider) {
   const isGroq = provider === MODEL_PROVIDERS.groq;
   const scanProfile = normalizeScanProfile(context?.scan_profile);
   const deep = scanProfile === 'deep';
-  const paramCandidates = workspaceUtils.collectParamCandidatesFromRequest(
-    context?.current_request && typeof context.current_request === 'object'
-      ? context.current_request
-      : {}
-  );
   const maxCandidates = isGroq ? (deep ? 28 : 18) : deep ? 36 : 28;
   const currentRequest = context?.current_request && typeof context.current_request === 'object'
     ? context.current_request
     : {};
+  const importMeta = compactImportMeta(currentRequest.importMeta, provider, deep);
+  const paramDescriptors = workspaceUtils.collectParamDescriptorsFromRequest({
+    ...currentRequest,
+    importMeta
+  });
+  const paramCandidates = [...new Set([
+    ...workspaceUtils.collectParamCandidatesFromRequest({ ...currentRequest, importMeta }),
+    ...paramDescriptors.map(entry => entry.name).filter(Boolean)
+  ])];
   const lastResponse = context?.last_response && typeof context.last_response === 'object'
     ? context.last_response
     : null;
   const testHistory = Array.isArray(context?.test_history) ? context.test_history : [];
+  const matchedCveRecords = securityKnowledge.selectRelevantSecurityKnowledge({
+    ...context,
+    current_request: {
+      ...currentRequest,
+      importMeta
+    }
+  }, {
+    maxResults: isGroq ? (deep ? 4 : 3) : deep ? 5 : 4
+  });
 
   const bodyLimit = isGroq ? (deep ? 900 : 400) : deep ? 1800 : 1200;
   const urlLimit = isGroq ? (deep ? 380 : 320) : deep ? 400 : 320;
@@ -1380,6 +1623,7 @@ function compactSecurityContext(context, provider) {
   const respPreviewLimit = isGroq ? (deep ? 900 : 450) : deep ? 1600 : 1200;
 
   return {
+    current_mode: ['planning', 'ask', 'agent'].includes(String(context?.current_mode)) ? String(context.current_mode) : 'agent',
     target_url: truncateText(context?.target_url, 240),
     scan_profile: scanProfile,
     param_candidates: paramCandidates.slice(0, maxCandidates),
@@ -1388,12 +1632,17 @@ function compactSecurityContext(context, provider) {
       url: truncateText(currentRequest.url, urlLimit),
       headers: compactHeaderLikeList(currentRequest.headers, isGroq ? (deep ? 8 : 6) : (deep ? 12 : 10), isGroq ? (deep ? 100 : 80) : (deep ? 160 : 140)),
       params: compactHeaderLikeList(currentRequest.params, isGroq ? (deep ? 8 : 6) : (deep ? 12 : 10), isGroq ? (deep ? 100 : 80) : (deep ? 160 : 140)),
-      body: truncateText(currentRequest.body, bodyLimit)
+      body: truncateText(currentRequest.body, bodyLimit),
+      import_meta: importMeta,
+      param_descriptors: compactParamDescriptors(paramDescriptors, isGroq ? (deep ? 16 : 10) : (deep ? 24 : 16), isGroq ? 60 : 90)
     },
     last_response: lastResponse ? {
       status: Number(lastResponse.status || 0),
       elapsed_ms: Number(lastResponse.elapsed_ms || 0),
-      body_preview: truncateText(lastResponse.body_preview, respPreviewLimit)
+      body_preview: truncateText(lastResponse.body_preview, respPreviewLimit),
+      headers: lastResponse.headers && typeof lastResponse.headers === 'object'
+        ? Object.fromEntries(Object.entries(lastResponse.headers).slice(0, 16).map(([key, value]) => [key.toLowerCase(), truncateText(value, 160)]))
+        : {}
     } : null,
     auth_context: context?.auth_context && typeof context.auth_context === 'object'
       ? {
@@ -1401,6 +1650,34 @@ function compactSecurityContext(context, provider) {
           value: truncateText(context.auth_context.value, isGroq ? (deep ? 120 : 80) : (deep ? 180 : 140))
         }
       : null,
+    matched_cve_records: matchedCveRecords.map(record => ({
+      family_id: truncateText(record.family_id, 32),
+      title: truncateText(record.title, isGroq ? 90 : 140),
+      family: truncateText(record.family, 40),
+      cwe: truncateText(record.cwe, 20),
+      owasp_api_label: truncateText(record.owasp_api_label, 80),
+      tags: Array.isArray(record.tags) ? record.tags.slice(0, 6) : [],
+      signal_patterns: Array.isArray(record.signal_patterns) ? record.signal_patterns.slice(0, 3).map(entry => truncateText(entry, isGroq ? 70 : 120)) : [],
+      safe_test_objectives: Array.isArray(record.safe_test_objectives) ? record.safe_test_objectives.slice(0, 3).map(entry => truncateText(entry, isGroq ? 80 : 140)) : [],
+      safe_detection_templates: Array.isArray(record.safe_detection_templates)
+        ? record.safe_detection_templates.slice(0, 3).map(entry => truncateText(entry, isGroq ? 90 : 150))
+        : [],
+      mutation_risk_templates: Array.isArray(record.mutation_risk_templates)
+        ? record.mutation_risk_templates.slice(0, 2).map(entry => truncateText(entry, isGroq ? 100 : 170))
+        : [],
+      negative_assertion_templates: Array.isArray(record.negative_assertion_templates)
+        ? record.negative_assertion_templates.slice(0, 3).map(entry => truncateText(entry, isGroq ? 70 : 120))
+        : [],
+      prompt_hints: Array.isArray(record.prompt_hints) ? record.prompt_hints.slice(0, 2).map(entry => truncateText(entry, isGroq ? 80 : 140)) : [],
+      matched_terms: Array.isArray(record.matched_terms) ? record.matched_terms.slice(0, 6).map(entry => truncateText(entry, 60)) : [],
+      safety_profile: truncateText(record.safety_profile, 32),
+      cve_examples: Array.isArray(record.cve_examples)
+        ? record.cve_examples.slice(0, 3).map(example => ({
+          id: truncateText(example?.id, 24),
+          title: truncateText(example?.title, isGroq ? 60 : 100)
+        }))
+        : []
+    })),
     test_history: testHistory.slice(isGroq ? (deep ? -8 : -6) : deep ? -16 : -12).map(entry => ({
       method: truncateText(entry?.method, 12),
       url: truncateText(entry?.url, 220),
@@ -1593,6 +1870,10 @@ function resolveModelSelection({ provider, requestedModel, profile = 'default', 
   };
 }
 
+function shouldAllowRequestedModelFallback(provider) {
+  return provider === MODEL_PROVIDERS.groq;
+}
+
 function normalizeGenerationResult(result, fallbackProvider, fallbackModel) {
   if (typeof result === 'string') {
     return {
@@ -1637,225 +1918,19 @@ function parseJsonObjectLoose(raw) {
 }
 
 function isNonEmptyString(value) {
-  return typeof value === 'string' && value.trim().length > 0;
+  return aiContracts.isNonEmptyString(value);
 }
 
 function normalizeKVArray(arr) {
-  if (!Array.isArray(arr)) return [];
-  return arr
-    .filter(item => item && typeof item === 'object' && typeof item.k === 'string')
-    .map(item => ({
-      k: item.k,
-      v: typeof item.v === 'string' ? item.v : ''
-    }));
+  return aiContracts.normalizeKVEntries(arr, { maxItems: 64 });
 }
 
 function validateAgentAction(action, index) {
-  if (!action || typeof action !== 'object') {
-    return { error: `actions[${index}] must be an object.` };
-  }
-
-  const allowedMethods = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
-  const type = action.type;
-  if (!isNonEmptyString(type)) {
-    return { error: `actions[${index}].type must be a non-empty string.` };
-  }
-
-  if (type === 'set_request') {
-    if (!allowedMethods.has(String(action.method || '').toUpperCase())) return { error: `actions[${index}] invalid method.` };
-    if (!isNonEmptyString(action.url)) return { error: `actions[${index}] missing url.` };
-    return {
-      value: {
-        type,
-        name: isNonEmptyString(action.name) ? action.name : 'Generated Request',
-        method: String(action.method).toUpperCase(),
-        url: action.url,
-        params: normalizeKVArray(action.params),
-        headers: normalizeKVArray(action.headers),
-        body: typeof action.body === 'string' ? action.body : ''
-      }
-    };
-  }
-
-  if (type === 'set_assertions') {
-    const assertions = Array.isArray(action.assertions)
-      ? action.assertions.filter(x => isNonEmptyString(x))
-      : [];
-    if (!assertions.length) return { error: `actions[${index}] has no valid assertions.` };
-    return { value: { type, assertions } };
-  }
-
-  if (type === 'chain_request') {
-    if (!allowedMethods.has(String(action.method || '').toUpperCase())) return { error: `actions[${index}] invalid method.` };
-    if (!isNonEmptyString(action.url) || !isNonEmptyString(action.name)) {
-      return { error: `actions[${index}] missing name/url.` };
-    }
-    return {
-      value: {
-        type,
-        name: action.name,
-        method: String(action.method).toUpperCase(),
-        url: action.url,
-        params: normalizeKVArray(action.params),
-        headers: normalizeKVArray(action.headers),
-        body: typeof action.body === 'string' ? action.body : '',
-        chainNote: typeof action.chainNote === 'string' ? action.chainNote : ''
-      }
-    };
-  }
-
-  if (type === 'debug_info') {
-    const findings = Array.isArray(action.findings)
-      ? action.findings.filter(x => isNonEmptyString(x))
-      : [];
-    if (!findings.length) return { error: `actions[${index}] has no valid findings.` };
-    return {
-      value: {
-        type,
-        findings,
-        fix: typeof action.fix === 'string' ? action.fix : '',
-        patch: action.patch && typeof action.patch === 'object' ? action.patch : undefined
-      }
-    };
-  }
-
-  return { error: `actions[${index}] unsupported type: ${type}.` };
+  return aiContracts.validateAgentAction(action, index);
 }
 
 function validateSecurityAction(action, index) {
-  if (!action || typeof action !== 'object') {
-    return { error: `actions[${index}] must be an object.` };
-  }
-
-  const type = action.type;
-  const allowedMethods = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
-  if (!isNonEmptyString(type)) return { error: `actions[${index}].type must be a non-empty string.` };
-
-  if (type === 'probe') {
-    const method = String(action.method || '').toUpperCase();
-    if (!allowedMethods.has(method) || !isNonEmptyString(action.url)) {
-      return { error: `actions[${index}] invalid probe method/url.` };
-    }
-    return {
-      value: {
-        type,
-        name: isNonEmptyString(action.name) ? action.name : 'Security probe',
-        method,
-        url: action.url,
-        headers: normalizeKVArray(action.headers),
-        params: normalizeKVArray(action.params),
-        body: typeof action.body === 'string' ? action.body : '',
-        vector: isNonEmptyString(action.vector) ? action.vector : 'Unknown',
-        hypothesis: typeof action.hypothesis === 'string' ? action.hypothesis : '',
-        auto_chain: Boolean(action.auto_chain)
-      }
-    };
-  }
-
-  if (type === 'probe_chain') {
-    const steps = Array.isArray(action.steps) ? action.steps : [];
-    if (!steps.length) return { error: `actions[${index}] probe_chain requires steps.` };
-    const normalizedSteps = [];
-    for (let i = 0; i < steps.length; i += 1) {
-      const step = steps[i];
-      const method = String(step?.method || '').toUpperCase();
-      if (!allowedMethods.has(method) || !isNonEmptyString(step?.url)) {
-        return { error: `actions[${index}].steps[${i}] invalid method/url.` };
-      }
-      normalizedSteps.push({
-        step: Number(step.step || i + 1),
-        name: isNonEmptyString(step.name) ? step.name : `Step ${i + 1}`,
-        method,
-        url: step.url,
-        headers: normalizeKVArray(step.headers),
-        body: typeof step.body === 'string' ? step.body : '',
-        vector: isNonEmptyString(step.vector) ? step.vector : 'Unknown',
-        hypothesis: typeof step.hypothesis === 'string' ? step.hypothesis : '',
-        extract: step.extract && typeof step.extract === 'object' ? step.extract : undefined
-      });
-    }
-    return {
-      value: {
-        type,
-        name: isNonEmptyString(action.name) ? action.name : 'Security probe chain',
-        steps: normalizedSteps
-      }
-    };
-  }
-
-  if (type === 'fuzz_list') {
-    const payloads = Array.isArray(action.payloads)
-      ? action.payloads.filter(x => isNonEmptyString(x))
-      : [];
-    if (!payloads.length) return { error: `actions[${index}] fuzz_list requires payloads.` };
-    return {
-      value: {
-        type,
-        vector: isNonEmptyString(action.vector) ? action.vector : 'Unknown',
-        target_param: typeof action.target_param === 'string' ? action.target_param : '',
-        target_location: typeof action.target_location === 'string' ? action.target_location : 'query',
-        payloads,
-        success_indicators: action.success_indicators && typeof action.success_indicators === 'object' ? action.success_indicators : {}
-      }
-    };
-  }
-
-  if (type === 'scan_plan') {
-    const rawSteps = Array.isArray(action.steps) ? action.steps : [];
-    const normalizedSteps = rawSteps.map((step, i) => ({
-      order: Number(step?.order || i + 1),
-      vector: isNonEmptyString(step?.vector) ? step.vector : 'Unknown',
-      description: typeof step?.description === 'string' ? step.description : '',
-      target_param: typeof step?.target_param === 'string' ? step.target_param : '',
-      owasp_api_label: typeof step?.owasp_api_label === 'string' ? step.owasp_api_label : ''
-    }));
-    const param_matrix = Array.isArray(action.param_matrix)
-      ? action.param_matrix
-        .map(entry => ({
-          param: typeof entry?.param === 'string' ? entry.param.trim() : '',
-          location: ['query', 'body', 'header'].includes(String(entry?.location))
-            ? entry.location
-            : 'query'
-        }))
-        .filter(entry => entry.param)
-      : [];
-    return {
-      value: {
-        type,
-        target: typeof action.target === 'string' ? action.target : '',
-        method_coverage: Array.isArray(action.method_coverage)
-          ? action.method_coverage.map(m => String(m).toUpperCase()).filter(Boolean)
-          : [],
-        steps: normalizedSteps,
-        param_matrix
-      }
-    };
-  }
-
-  if (type === 'set_assertions') {
-    const assertions = Array.isArray(action.assertions)
-      ? action.assertions.filter(x => isNonEmptyString(x))
-      : [];
-    if (!assertions.length) return { error: `actions[${index}] has no valid assertions.` };
-    return { value: { type, assertions } };
-  }
-
-  if (type === 'debug_info') {
-    const findings = Array.isArray(action.findings)
-      ? action.findings.filter(x => isNonEmptyString(x))
-      : [];
-    if (!findings.length) return { error: `actions[${index}] has no valid findings.` };
-    return {
-      value: {
-        type,
-        findings,
-        fix: typeof action.fix === 'string' ? action.fix : '',
-        patch: action.patch && typeof action.patch === 'object' ? action.patch : undefined
-      }
-    };
-  }
-
-  return { error: `actions[${index}] unsupported type: ${type}.` };
+  return aiContracts.validateSecurityAction(action, index);
 }
 
 function parseAgentPayload(raw) {
@@ -1888,15 +1963,13 @@ function parseAgentPayload(raw) {
 
 function parseSecurityPayload(raw) {
   const parsed = parseJsonObjectLoose(raw);
-  const levels = new Set(['none', 'low', 'medium', 'high', 'critical']);
-  const findingSeverities = new Set(['info', 'low', 'medium', 'high', 'critical']);
 
   if (!isNonEmptyString(parsed.message)) {
     const err = new Error('Security model output is missing required field: message.');
     err.status = 502;
     throw err;
   }
-  if (!levels.has(parsed.threat_level)) {
+  if (!aiContracts.SECURITY_THREAT_LEVELS.has(parsed.threat_level)) {
     const err = new Error('Security model output has invalid threat_level.');
     err.status = 502;
     throw err;
@@ -1909,26 +1982,15 @@ function parseSecurityPayload(raw) {
 
   const normalizedFindings = [];
   parsed.findings.forEach((finding, index) => {
-    if (!finding || typeof finding !== 'object') {
-      const err = new Error(`Security finding at index ${index} must be an object.`);
-      err.status = 502;
-      throw err;
-    }
-    if (!findingSeverities.has(finding.severity)) {
-      const err = new Error(`Security finding at index ${index} has invalid severity.`);
+    const normalized = aiContracts.normalizeSecurityFinding(finding, index);
+    if (!normalized) {
+      const err = new Error(`Security finding at index ${index} is invalid.`);
       err.status = 502;
       throw err;
     }
     normalizedFindings.push({
-      id: typeof finding.id === 'string' ? finding.id : `FINDING-${String(index + 1).padStart(3, '0')}`,
-      vulnerability: typeof finding.vulnerability === 'string' ? finding.vulnerability : 'Unknown',
-      severity: finding.severity,
-      evidence: typeof finding.evidence === 'string' ? finding.evidence : '',
-      cve_hint: typeof finding.cve_hint === 'string' || finding.cve_hint === null ? finding.cve_hint : null,
-      owasp_api_label: typeof finding.owasp_api_label === 'string' && finding.owasp_api_label.trim()
-        ? truncateText(finding.owasp_api_label, 160)
-        : null,
-      remediation: typeof finding.remediation === 'string' ? finding.remediation : ''
+      ...normalized,
+      owasp_api_label: normalized.owasp_api_label ? truncateText(normalized.owasp_api_label, 160) : null
     });
   });
 
@@ -1953,13 +2015,39 @@ function parseSecurityPayload(raw) {
   };
 }
 
-function parseAssertionsPayload(raw) {
+function validateSecurityPayloadSemantics(payload, context = {}) {
+  const mode = ['planning', 'ask', 'agent'].includes(String(context?.current_mode))
+    ? String(context.current_mode)
+    : 'agent';
+  const actions = Array.isArray(payload?.actions) ? payload.actions : [];
+
+  if (mode === 'planning') {
+    if (!actions.length) {
+      const err = new Error('Security output failed semantic validation: planning mode requires a scan_plan action.');
+      err.status = 502;
+      throw err;
+    }
+    if (actions[0]?.type !== 'scan_plan') {
+      const err = new Error('Security output failed semantic validation: planning mode must return scan_plan as the first action.');
+      err.status = 502;
+      throw err;
+    }
+  }
+
+  return payload;
+}
+
+function parseAssertionsPayload(raw, options = {}) {
   const parsed = parseJsonObjectLoose(raw);
-  const assertions = Array.isArray(parsed?.assertions)
-    ? parsed.assertions.filter(x => isNonEmptyString(x))
-    : [];
+  const assertions = aiContracts.normalizeAssertionExpressions(parsed?.assertions, { maxItems: 12 });
   if (!assertions.length) {
     const err = new Error('Assertions payload is missing a non-empty assertions array.');
+    err.status = 502;
+    throw err;
+  }
+  const semanticCheck = validateGeneratedAssertions(assertions, options);
+  if (!semanticCheck.ok) {
+    const err = new Error(`Assertions failed semantic validation: ${semanticCheck.errors.join(' | ')}`);
     err.status = 502;
     throw err;
   }
@@ -1967,31 +2055,65 @@ function parseAssertionsPayload(raw) {
 }
 
 const ASSERTIONS_MODES = new Set(['functional', 'security', 'contract']);
+const ASSERTION_STRICTNESS = new Set(['balanced', 'strict', 'aggressive']);
+const ASSERTION_AUTH_EXPECTATIONS = new Set(['auto', 'required', 'optional']);
 
 function normalizeAssertionsMode(raw) {
   const m = typeof raw === 'string' ? raw.toLowerCase().trim() : '';
   return ASSERTIONS_MODES.has(m) ? m : 'functional';
 }
 
+function normalizeAssertionPreferences(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const strictness = ASSERTION_STRICTNESS.has(source.strictness) ? source.strictness : 'balanced';
+  const authExpectation = ASSERTION_AUTH_EXPECTATIONS.has(source.auth_expectation) ? source.auth_expectation : 'auto';
+  return {
+    strictness,
+    auth_expectation: authExpectation,
+    include_negative_checks: source.include_negative_checks !== false,
+    include_timing_checks: Boolean(source.include_timing_checks)
+  };
+}
+
 function buildAssertionsSystemPrompt(mode) {
   switch (mode) {
     case 'security':
-      return 'You are an API security testing assistant. Generate assertions that detect verbose errors, stack traces, SQL/NoSQL error signatures, missing authentication when it should be required, and sensitive tokens in plaintext. Use variables: status (number), json (parsed object or null), body (string). Return strict JSON only: {"assertions": string[]}.';
+      return 'You are an API security testing assistant. Return strict JSON only: {"assertions": string[]}. Generate only executable JS assertions using the supported syntax: ===, !==, >, <, >=, <=, &&, ||, !, typeof, Array.isArray(x), body.includes(), body.startsWith(), body.endsWith(), obj.hasOwnProperty(), json.field, json.items[0], status, elapsed_ms, elapsed. Assertions must be specific, non-duplicated, and tied to the observed response. Cover status/auth behavior, negative leakage checks, and dangerous error content.';
     case 'contract':
-      return 'You are an API contract testing assistant. Generate assertions that validate required fields, types, and array lengths using expected_schema when provided. Use variables: status, json, body. Return strict JSON only: {"assertions": string[]}.';
+      return 'You are an API contract testing assistant. Return strict JSON only: {"assertions": string[]}. Generate only executable JS assertions using the supported syntax: ===, !==, >, <, >=, <=, &&, ||, !, typeof, Array.isArray(x), body.includes(), body.startsWith(), body.endsWith(), obj.hasOwnProperty(), json.field, json.items[0], status, elapsed_ms, elapsed. Validate required fields, field types, array expectations, and schema conformance using expected_schema and the observed response.';
     default:
-      return 'You are an API testing assistant. Return strict JSON only.';
+      return 'You are an API testing assistant. Return strict JSON only: {"assertions": string[]}. Generate only executable JS assertions using the supported syntax: ===, !==, >, <, >=, <=, &&, ||, !, typeof, Array.isArray(x), body.includes(), body.startsWith(), body.endsWith(), obj.hasOwnProperty(), json.field, json.items[0], status, elapsed_ms, elapsed. Assertions must be specific to the response and must not be duplicates or tautologies.';
   }
 }
 
-function buildAssertionsInstructionText(mode) {
+function buildAssertionsInstructionText(mode, preferences = {}) {
+  const strictness = preferences.strictness || 'balanced';
+  const countHint = strictness === 'aggressive'
+    ? '6 to 9'
+    : strictness === 'strict'
+      ? '5 to 8'
+      : mode === 'security'
+        ? '5 to 7'
+        : '4 to 6';
+  const timingInstruction = preferences.include_timing_checks
+    ? 'Include one timing check when latency signal is available.'
+    : 'Do not include timing checks unless latency data clearly matters.';
+  const negativeInstruction = preferences.include_negative_checks
+    ? 'Include at least one negative guard such as leaked error text or forbidden content.'
+    : 'Skip negative body-content checks unless the response strongly suggests them.';
+  const authInstruction = preferences.auth_expectation === 'required'
+    ? 'Assume authentication should be required and include an auth expectation.'
+    : preferences.auth_expectation === 'optional'
+      ? 'Do not force auth-specific assertions unless the response already proves auth enforcement.'
+      : 'Infer whether auth assertions are appropriate from the request and response.';
+
   switch (mode) {
     case 'security':
-      return 'Generate 5 to 8 assertions as JS expressions. Prefer negative checks (!body.includes), auth expectations, and status gates.';
+      return `Generate ${countHint} security assertions as JS expressions. Cover status/auth expectations, sensitive-data leakage checks, verbose error guards, and one response-shape check. ${negativeInstruction} ${timingInstruction} ${authInstruction}`;
     case 'contract':
-      return 'Generate 4 to 8 assertions validating the response against expected_schema and response shape.';
+      return `Generate ${countHint} contract assertions validating required fields, response shape, field types, and schema expectations. Use exact field names from the response or expected_schema. ${timingInstruction}`;
     default:
-      return 'Generate 4 to 6 useful test assertions as JS expressions using variables: status, json, body. Return shape: {"assertions": ["..."]}.';
+      return `Generate ${countHint} functional assertions. Cover status, shape or field existence, one value or type check, and one negative guard. Use exact response fields instead of generic placeholders. ${negativeInstruction} ${timingInstruction} ${authInstruction}`;
   }
 }
 
@@ -2047,12 +2169,13 @@ app.post('/api/agent', async (req, res) => {
     const requestedModel = req.body?.model;
     const hasExplicitModel = typeof requestedModel === 'string' && requestedModel.trim().length > 0;
     const provider = parseProvider(req.body?.provider);
+    const allowRequestedModelFallback = shouldAllowRequestedModelFallback(provider);
     const selection = resolveModelSelection({
       provider,
       requestedModel,
       profile: 'default',
       taskType: TASK_TYPES.agent,
-      allowModelFallback: !hasExplicitModel
+      allowModelFallback: !hasExplicitModel || allowRequestedModelFallback
     });
 
     if (!context || typeof context !== 'object') {
@@ -2091,7 +2214,7 @@ app.post('/api/agent', async (req, res) => {
           model: selection.preferred,
           profile: 'default',
           taskType: TASK_TYPES.agent,
-          allowModelFallback: !hasExplicitModel,
+          allowModelFallback: !hasExplicitModel || allowRequestedModelFallback,
           systemPrompt: effectiveSystemPrompt,
           userContent: effectiveUserContent,
           maxTokens: 1000,
@@ -2151,17 +2274,27 @@ app.post('/api/agent', async (req, res) => {
 
 app.post('/api/assertions', async (req, res) => {
   try {
-    const responseStatus = req.body?.status;
+    const responseStatus = req.body?.response_status ?? req.body?.status;
     const bodyPreview = req.body?.body_preview;
+    const responseHeaders = req.body?.response_headers;
+    const elapsedMs = req.body?.elapsed_ms;
+    const responseJsonSummary = req.body?.response_json_summary;
+    const currentRequest = req.body?.current_request && typeof req.body.current_request === 'object'
+      ? req.body.current_request
+      : {};
+    const currentAssertions = Array.isArray(req.body?.current_assertions)
+      ? req.body.current_assertions.filter(x => typeof x === 'string' && x.trim()).slice(0, 12)
+      : [];
     const requestedModel = req.body?.model;
     const hasExplicitModel = typeof requestedModel === 'string' && requestedModel.trim().length > 0;
     const provider = parseProvider(req.body?.provider);
+    const allowRequestedModelFallback = shouldAllowRequestedModelFallback(provider);
     const selection = resolveModelSelection({
       provider,
       requestedModel,
       profile: 'default',
       taskType: TASK_TYPES.assertions,
-      allowModelFallback: !hasExplicitModel
+      allowModelFallback: !hasExplicitModel || allowRequestedModelFallback
     });
 
     if (typeof responseStatus !== 'number') {
@@ -2169,17 +2302,39 @@ app.post('/api/assertions', async (req, res) => {
     }
 
     const mode = normalizeAssertionsMode(req.body?.mode);
+    const preferences = normalizeAssertionPreferences(req.body?.preferences);
     const assertionGoals = Array.isArray(req.body?.assertion_goals)
       ? req.body.assertion_goals.filter(x => typeof x === 'string' && x.trim()).slice(0, 12)
       : [];
     const expectedSchema = req.body?.expected_schema;
+    const normalizedImportMeta = compactImportMeta(currentRequest.importMeta, provider, preferences.strictness !== 'balanced');
+    const paramDescriptors = workspaceUtils.collectParamDescriptorsFromRequest({
+      ...currentRequest,
+      importMeta: normalizedImportMeta
+    });
     const instruction = {
       mode,
-      instruction: buildAssertionsInstructionText(mode),
+      instruction: buildAssertionsInstructionText(mode, preferences),
+      preferences,
       assertion_goals: assertionGoals,
       ...(expectedSchema !== undefined && expectedSchema !== null ? { expected_schema: expectedSchema } : {}),
-      status: responseStatus,
-      body_preview: typeof bodyPreview === 'string' ? bodyPreview : ''
+      current_request: {
+        method: truncateText(currentRequest.method, 12),
+        url: truncateText(currentRequest.url, 320),
+        headers: compactHeaderLikeList(currentRequest.headers, 12, 140),
+        params: compactHeaderLikeList(currentRequest.params, 12, 140),
+        body: truncateText(currentRequest.body, 1400),
+        import_meta: normalizedImportMeta,
+        param_descriptors: compactParamDescriptors(paramDescriptors, 24, 100)
+      },
+      current_assertions: currentAssertions,
+      response_status: responseStatus,
+      response_headers: responseHeaders && typeof responseHeaders === 'object'
+        ? Object.fromEntries(Object.entries(responseHeaders).slice(0, 20).map(([key, value]) => [String(key).toLowerCase(), truncateText(value, 180)]))
+        : {},
+      elapsed_ms: Number(elapsedMs || 0),
+      body_preview: typeof bodyPreview === 'string' ? bodyPreview.slice(0, 2000) : '',
+      response_json_summary: typeof responseJsonSummary === 'string' ? responseJsonSummary.slice(0, 2000) : ''
     };
 
     const systemPrompt = buildAssertionsSystemPrompt(mode);
@@ -2215,7 +2370,7 @@ app.post('/api/assertions', async (req, res) => {
           model: selection.preferred,
           profile: 'default',
           taskType: TASK_TYPES.assertions,
-          allowModelFallback: !hasExplicitModel,
+          allowModelFallback: !hasExplicitModel || allowRequestedModelFallback,
           systemPrompt: effectiveSystemPrompt,
           userContent: effectiveUserContent,
           maxTokens: 800,
@@ -2235,9 +2390,20 @@ app.post('/api/assertions', async (req, res) => {
     const initialResult = await runAssertionsGeneration({});
     const repaired = await parseWithRepairLoop({
       initialRaw: initialResult.raw,
-      parseFn: parseAssertionsPayload,
+      parseFn: raw => parseAssertionsPayload(raw, {
+        mode,
+        parsedJson: tryParseJson(typeof bodyPreview === 'string' ? bodyPreview : ''),
+        expectedSchema,
+        preferences
+      }),
       buildRepairInput: ({ error, raw, attempt }) => {
-        const countHint = mode === 'security' ? '5-8' : mode === 'contract' ? '4-8' : '4-6';
+        const countHint = preferences.strictness === 'aggressive'
+          ? '6-9'
+          : preferences.strictness === 'strict'
+            ? '5-8'
+            : mode === 'security'
+              ? '5-7'
+              : '4-6';
         const repairSystemPrompt = `${systemPrompt}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON matching {\"assertions\": string[]} with ${countHint} assertions.`;
         const repairUserContent = JSON.stringify({
           task: 'repair_assertions_output',
@@ -2277,12 +2443,13 @@ app.post('/api/security-agent', async (req, res) => {
     const provider = parseProvider(req.body?.provider);
     const requestedModel = req.body?.model;
     const hasExplicitModel = typeof requestedModel === 'string' && requestedModel.trim().length > 0;
+    const allowRequestedModelFallback = shouldAllowRequestedModelFallback(provider);
     const selection = resolveModelSelection({
       provider,
       requestedModel,
       profile: 'security',
       taskType: TASK_TYPES.security,
-      allowModelFallback: !hasExplicitModel
+      allowModelFallback: !hasExplicitModel || allowRequestedModelFallback
     });
     const bodyContext = req.body?.context;
     const context = bodyContext && typeof bodyContext === 'object'
@@ -2303,7 +2470,8 @@ app.post('/api/security-agent', async (req, res) => {
       context.scan_profile = req.body.scan_profile;
     }
 
-    const securityUserContent = JSON.stringify(compactSecurityContext(context, provider));
+    const compactedSecurityContext = compactSecurityContext(context, provider);
+    const securityUserContent = JSON.stringify(compactedSecurityContext);
     const runSecurityGeneration = async ({ systemPromptOverride, userContentOverride }) => {
       const effectiveSystemPrompt = systemPromptOverride || SECURITY_MASTER_PROMPT;
       const effectiveUserContent = userContentOverride || securityUserContent;
@@ -2340,7 +2508,7 @@ app.post('/api/security-agent', async (req, res) => {
           model: selection.preferred,
           profile: 'security',
           taskType: TASK_TYPES.security,
-          allowModelFallback: !hasExplicitModel,
+          allowModelFallback: !hasExplicitModel || allowRequestedModelFallback,
           systemPrompt: effectiveSystemPrompt,
           userContent: effectiveUserContent,
           temperature: 0.1,
@@ -2364,13 +2532,18 @@ app.post('/api/security-agent', async (req, res) => {
     const initialResult = await runSecurityGeneration({});
     const repaired = await parseWithRepairLoop({
       initialRaw: initialResult.raw,
-      parseFn: parseSecurityPayload,
+      parseFn: raw => validateSecurityPayloadSemantics(parseSecurityPayload(raw), compactedSecurityContext),
       buildRepairInput: ({ error, raw, attempt }) => {
-        const repairSystemPrompt = `${SECURITY_MASTER_PROMPT}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON with fields: message, threat_level, findings[], actions[].`;
+        const planningHint = compactedSecurityContext.current_mode === 'planning'
+          ? '\nPlanning mode is active. You MUST return a scan_plan as the first action with non-empty steps.'
+          : '';
+        const repairSystemPrompt = `${SECURITY_MASTER_PROMPT}\n\nSTRICT STRUCTURED OUTPUT REPAIR\nReturn only valid JSON with fields: message, threat_level, findings[], actions[].${planningHint}`;
         const repairUserContent = JSON.stringify({
           task: 'repair_security_output',
           attempt,
+          current_mode: compactedSecurityContext.current_mode,
           validation_error: error.message,
+          user_instruction: compactedSecurityContext.user_instruction,
           original_output: String(raw || '').slice(0, 12000)
         });
         return { repairSystemPrompt, repairUserContent };
@@ -2387,6 +2560,7 @@ app.post('/api/security-agent', async (req, res) => {
       diagnostics: {
         ...repaired.diagnostics,
         engine: 'security',
+        matched_cve_records: compactedSecurityContext.matched_cve_records,
         provider: initialResult.provider,
         model: initialResult.model,
         requested_provider: provider,
@@ -2530,5 +2704,15 @@ if (require.main === module) {
     console.log(`AgentMan server listening on http://localhost:${PORT}`);
   });
 }
+
+app.__internals = {
+  normalizeAssertionPreferences,
+  buildAssertionsInstructionText,
+  parseAssertionsPayload,
+  validateSecurityPayloadSemantics,
+  validateGeneratedAssertions,
+  compactSecurityContext,
+  extractStructuredTextPayload
+};
 
 module.exports = app;

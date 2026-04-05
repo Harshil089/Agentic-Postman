@@ -38,6 +38,9 @@ describe('import-spec', () => {
     };
     const { requests } = parseOpenApiToRequests(spec);
     expect(requests[0].params.some(p => p.k === 'q')).toBe(true);
+    expect(requests[0].importMeta.param_descriptors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'q', location: 'query' })
+    ]));
   });
 
   test('parsePostmanCollectionToRequests flattens items', () => {

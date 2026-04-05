@@ -3,6 +3,7 @@ const {
   describeRequestDiff,
   resolveChainTemplate,
   resolveVariableTemplate,
+  collectParamDescriptorsFromRequest,
   collectParamCandidatesFromRequest,
   arrayBufferToHex,
   computeSha256Hash,
@@ -66,6 +67,29 @@ describe('workspace-utils', () => {
     };
     const keys = collectParamCandidatesFromRequest(req);
     expect(keys).toEqual(expect.arrayContaining(['sort', 'page', 'filter', 'title', 'nested']));
+  });
+
+  test('collectParamDescriptorsFromRequest captures nested request metadata', () => {
+    const req = {
+      url: 'https://api.example.com/users/{userId}?expand=posts',
+      params: [{ k: 'limit', v: '10' }],
+      headers: [{ k: 'Authorization', v: 'Bearer token' }, { k: 'Content-Type', v: 'application/json' }],
+      body: JSON.stringify({ profile: { firstName: 'Ada' }, tags: ['x'] }),
+      importMeta: {
+        source: 'openapi',
+        param_descriptors: [
+          { name: 'userId', path: 'userId', location: 'path', type: 'integer', required: true, source: 'openapi.parameter' }
+        ]
+      }
+    };
+    const descriptors = collectParamDescriptorsFromRequest(req);
+
+    expect(descriptors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'userId', location: 'path' }),
+      expect.objectContaining({ name: 'expand', location: 'query' }),
+      expect.objectContaining({ name: 'Authorization', location: 'header' }),
+      expect.objectContaining({ path: 'profile.firstName', location: 'body' })
+    ]));
   });
 
   test('compareToSnapshot detects matching response', () => {

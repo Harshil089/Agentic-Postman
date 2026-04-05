@@ -1,4 +1,8 @@
 (function initWorkspaceUtils(globalScope) {
+  const aiContracts = (typeof globalScope !== 'undefined' && globalScope.AgentmanAiContracts)
+    ? globalScope.AgentmanAiContracts
+    : (typeof require === 'function' ? require('./ai-contracts') : null);
+
   function summarizePreview(text, limit = 320) {
     const value = String(text || '').trim();
     if (!value) return '';
@@ -229,37 +233,151 @@
     return result;
   }
 
-  /**
-   * Collects query param keys, KV param keys, and JSON body top-level keys for scan/agent context.
-   * @param {object} currentRequest - { url, params[], headers[], body }
-   * @returns {string[]}
-   */
-  function collectParamCandidatesFromRequest(currentRequest) {
-    const keys = new Set();
-    const cr = currentRequest && typeof currentRequest === 'object' ? currentRequest : {};
-    if (Array.isArray(cr.params)) {
-      cr.params.forEach(p => {
-        const k = typeof p?.k === 'string' ? p.k.trim() : '';
-        if (k) keys.add(k);
+  function inferPrimitiveType(value) {
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return 'array';
+    if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';
+    if (typeof value === 'boolean') return 'boolean';
+    if (typeof value === 'string') return 'string';
+    if (value && typeof value === 'object') return 'object';
+    return 'unknown';
+  }
+
+  function normalizeDescriptor(raw, index) {
+    if (aiContracts && typeof aiContracts.normalizeParamDescriptor === 'function') {
+      return aiContracts.normalizeParamDescriptor(raw, index);
+    }
+    return raw;
+  }
+
+  function appendDescriptor(target, seen, raw) {
+    const descriptor = normalizeDescriptor(raw, target.length);
+    if (!descriptor || !descriptor.name || !descriptor.path) return;
+    const key = `${descriptor.location}:${descriptor.path}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    target.push(descriptor);
+  }
+
+  function collectJsonParamDescriptors(value, basePath, target, seen, options = {}) {
+    const {
+      maxDepth = 3,
+      depth = 0,
+      source = 'request.body'
+    } = options;
+    if (value == null || depth > maxDepth) return;
+
+    if (Array.isArray(value)) {
+      const sample = value[0];
+      appendDescriptor(target, seen, {
+        name: basePath.split('.').pop() || 'item',
+        path: basePath,
+        location: 'body',
+        type: 'array',
+        required: false,
+        source,
+        example: Array.isArray(sample) || (sample && typeof sample === 'object') ? undefined : sample
+      });
+      if (sample && typeof sample === 'object') {
+        collectJsonParamDescriptors(sample, `${basePath}[0]`, target, seen, {
+          maxDepth,
+          depth: depth + 1,
+          source
+        });
+      }
+      return;
+    }
+
+    if (typeof value === 'object') {
+      if (basePath) {
+        appendDescriptor(target, seen, {
+          name: basePath.split('.').pop() || basePath,
+          path: basePath,
+          location: 'body',
+          type: 'object',
+          required: false,
+          source
+        });
+      }
+      Object.entries(value).slice(0, 40).forEach(([key, nested]) => {
+        const path = basePath ? `${basePath}.${key}` : key;
+        appendDescriptor(target, seen, {
+          name: key,
+          path,
+          location: 'body',
+          type: inferPrimitiveType(nested),
+          required: false,
+          source,
+          example: nested !== null && typeof nested !== 'object' ? nested : undefined
+        });
+        if (nested && typeof nested === 'object') {
+          collectJsonParamDescriptors(nested, path, target, seen, {
+            maxDepth,
+            depth: depth + 1,
+            source
+          });
+        }
       });
     }
+  }
+
+  function collectParamDescriptorsFromRequest(currentRequest) {
+    const descriptors = [];
+    const seen = new Set();
+    const cr = currentRequest && typeof currentRequest === 'object' ? currentRequest : {};
+
+    const importMeta = cr.importMeta && typeof cr.importMeta === 'object' ? cr.importMeta : null;
+    if (importMeta && Array.isArray(importMeta.param_descriptors)) {
+      importMeta.param_descriptors.forEach(entry => appendDescriptor(descriptors, seen, entry));
+    }
+
     const urlRaw = typeof cr.url === 'string' ? cr.url : '';
     if (urlRaw) {
+      const placeholderMatches = [...urlRaw.matchAll(/\{([^}]+)\}/g)];
+      placeholderMatches.forEach(match => {
+        const name = String(match[1] || '').trim();
+        if (!name) return;
+        appendDescriptor(descriptors, seen, {
+          name,
+          path: name,
+          location: 'path',
+          type: 'string',
+          required: true,
+          source: 'request.url'
+        });
+      });
+
       try {
         const href = urlRaw.includes('://')
           ? urlRaw
           : `https://placeholder.invalid${urlRaw.startsWith('/') ? '' : '/'}${urlRaw}`;
-        const u = new URL(href);
-        u.searchParams.forEach((_v, k) => {
-          if (k) keys.add(k);
+        const url = new URL(href);
+        url.searchParams.forEach((value, key) => {
+          appendDescriptor(descriptors, seen, {
+            name: key,
+            path: key,
+            location: 'query',
+            type: inferPrimitiveType(value),
+            required: false,
+            source: 'request.url',
+            example: value
+          });
         });
       } catch {
-        const q = urlRaw.indexOf('?');
-        if (q >= 0) {
+        const queryIndex = urlRaw.indexOf('?');
+        if (queryIndex >= 0) {
           try {
-            const sp = new URLSearchParams(urlRaw.slice(q + 1));
-            sp.forEach((_v, k) => {
-              if (k) keys.add(k);
+            const params = new URLSearchParams(urlRaw.slice(queryIndex + 1));
+            params.forEach((value, key) => {
+              appendDescriptor(descriptors, seen, {
+                name: key,
+                path: key,
+                location: 'query',
+                type: inferPrimitiveType(value),
+                required: false,
+                source: 'request.url',
+                example: value
+              });
             });
           } catch {
             /* ignore */
@@ -267,21 +385,69 @@
         }
       }
     }
+
+    if (Array.isArray(cr.params)) {
+      cr.params.forEach(entry => {
+        const key = typeof entry?.k === 'string' ? entry.k.trim() : '';
+        if (!key) return;
+        appendDescriptor(descriptors, seen, {
+          name: key,
+          path: key,
+          location: 'query',
+          type: inferPrimitiveType(entry.v),
+          required: false,
+          source: 'request.params',
+          example: typeof entry.v === 'string' ? entry.v : undefined
+        });
+      });
+    }
+
+    if (Array.isArray(cr.headers)) {
+      cr.headers.forEach(entry => {
+        const key = typeof entry?.k === 'string' ? entry.k.trim() : '';
+        if (!key) return;
+        appendDescriptor(descriptors, seen, {
+          name: key,
+          path: key,
+          location: 'header',
+          type: 'string',
+          required: false,
+          source: 'request.headers',
+          example: typeof entry.v === 'string' ? entry.v : undefined
+        });
+      });
+    }
+
     const body = typeof cr.body === 'string' ? cr.body : '';
     const headers = Array.isArray(cr.headers) ? cr.headers : [];
-    const ct = headers.find(h => String(h?.k || '').toLowerCase() === 'content-type');
+    const ct = headers.find(header => String(header?.k || '').toLowerCase() === 'content-type');
     const ctype = ct ? String(ct.v || '').toLowerCase() : '';
-    if (body && (ctype.includes('json') || body.trim().startsWith('{'))) {
+    if (body && (ctype.includes('json') || body.trim().startsWith('{') || body.trim().startsWith('['))) {
       try {
         const parsed = JSON.parse(body);
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          Object.keys(parsed).slice(0, 40).forEach(k => keys.add(k));
-        }
+        collectJsonParamDescriptors(parsed, '', descriptors, seen, {
+          maxDepth: 3,
+          source: 'request.body'
+        });
       } catch {
         /* ignore */
       }
     }
-    return [...keys].filter(Boolean).slice(0, 40);
+
+    return descriptors.slice(0, 80);
+  }
+
+  /**
+   * Collects query param keys, KV param keys, and JSON body keys for scan/agent context.
+   * @param {object} currentRequest - { url, params[], headers[], body }
+   * @returns {string[]}
+   */
+  function collectParamCandidatesFromRequest(currentRequest) {
+    return [...new Set(
+      collectParamDescriptorsFromRequest(currentRequest)
+        .map(entry => entry.name)
+        .filter(Boolean)
+    )].slice(0, 40);
   }
 
   const api = {
@@ -289,6 +455,7 @@
     describeRequestDiff,
     resolveChainTemplate,
     resolveVariableTemplate,
+    collectParamDescriptorsFromRequest,
     collectParamCandidatesFromRequest,
     arrayBufferToHex,
     computeSha256Hash,

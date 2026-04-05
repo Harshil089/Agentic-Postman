@@ -8,6 +8,7 @@ const workspaceUtils = require('./workspace-utils');
 const importSpec = require('./import-spec');
 const aiContracts = require('./ai-contracts');
 const securityKnowledge = require('./security-knowledge');
+const securityPolicyPacks = require('./security-policy-packs');
 
 dotenv.config();
 
@@ -617,7 +618,7 @@ CONTEXT YOU RECEIVE PER TURN
 - user_instruction  : plain English command from the tester
 - param_candidates  : string[] — query keys, body keys, and param-table keys from current_request; prefer these for probes/fuzz_list targets instead of guessing "id" only
 - current_request.param_descriptors : array of { name, path, location, type, required, source, example?, default? }
-- matched_cve_records : curated CVE/CWE guidance with signal_patterns, safe_test_objectives, safe_detection_templates, mutation_risk_templates, negative_assertion_templates, and prompt_hints relevant to this endpoint
+- matched_cve_records : curated CVE/CWE guidance with signal_patterns, safe_test_objectives, safe_detection_templates, mutation_risk_templates, negative_assertion_templates, payload_packs, execution_guards, and prompt_hints relevant to this endpoint
 - scan_profile      : "quick" | "standard" | "deep" — quick=fewer probes; standard=balanced; deep=more fuzz_list rows and param rotation
 
 OUTPUT CONTRACT - RAW JSON ONLY, ZERO MARKDOWN
@@ -630,6 +631,8 @@ OUTPUT CONTRACT - RAW JSON ONLY, ZERO MARKDOWN
       "vulnerability": "short name e.g. IDOR, SQLi, Auth Bypass",
       "severity": "info" | "low" | "medium" | "high" | "critical",
       "evidence": "exact field/value/header from the response that proves this",
+      "evidence_delta": "explicit delta vs prior baseline, for example status_transition 401->200 or newly leaked token field",
+      "confidence": 0.0,
       "cve_hint": "CVE-YYYY-NNNNN or CWE-NNN if applicable, else null",
       "owasp_api_label": "optional OWASP API Top 10 2023 label e.g. API1:2023 Broken Object Level Authorization",
       "remediation": "one sentence fix"
@@ -653,6 +656,7 @@ ACTION TYPES
             "MassAssignment" | "RateLimit" | "PathTraversal" | "BOLA" |
             "InfoDisclosure" | "CommandInjection" | "ParameterPollution" |
             "CachePoisoning" | "UnrestrictedUpload" | "BusinessLogic",
+  "safety_tier": "safe" | "controlled-mutation" | "high-risk",
   "hypothesis": "what a positive result looks like",
   "auto_chain": true | false
 }
@@ -802,7 +806,9 @@ BEHAVIORAL RULES
 15. Map findings to OWASP API Top 10 (2023) in owasp_api_label when applicable (API1 Broken Object Level Authorization … API10 Unsafe Consumption of APIs).
 16. When matched_cve_records are present, use them to prioritize vulnerability families, evidence patterns, and safe test objectives for the current endpoint.
 17. Prefer matched_cve_records.safe_detection_templates for the first executable probes; only escalate toward mutation_risk_templates when the user explicitly asks for higher-risk testing or when safe probes are exhausted.
-18. When emitting set_assertions, reuse matched_cve_records.negative_assertion_templates where they fit the observed response.`;
+18. When emitting set_assertions, reuse matched_cve_records.negative_assertion_templates where they fit the observed response.
+19. Respect matched_cve_records.payload_packs tiers: safe first, controlled_mutation after explicit user approval, high_risk only with explicit high-risk authorization and disposable targets.
+20. Use recent test_history.drift signals (status transitions and newly leaked terms) to adapt later scan steps rather than repeating static probes.`;
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(__dirname));
@@ -1668,6 +1674,34 @@ function compactSecurityContext(context, provider) {
       negative_assertion_templates: Array.isArray(record.negative_assertion_templates)
         ? record.negative_assertion_templates.slice(0, 3).map(entry => truncateText(entry, isGroq ? 70 : 120))
         : [],
+      payload_packs: record.payload_packs && typeof record.payload_packs === 'object'
+        ? {
+            safe: Array.isArray(record.payload_packs.safe)
+              ? record.payload_packs.safe.slice(0, 4).map(entry => ({
+                location: truncateText(entry?.location, 20),
+                key: truncateText(entry?.key, 40),
+                value: truncateText(entry?.value, isGroq ? 40 : 80)
+              }))
+              : [],
+            controlled_mutation: Array.isArray(record.payload_packs.controlled_mutation)
+              ? record.payload_packs.controlled_mutation.slice(0, 3).map(entry => ({
+                location: truncateText(entry?.location, 20),
+                key: truncateText(entry?.key, 40),
+                value: truncateText(entry?.value, isGroq ? 40 : 80)
+              }))
+              : [],
+            high_risk: Array.isArray(record.payload_packs.high_risk)
+              ? record.payload_packs.high_risk.slice(0, 2).map(entry => ({
+                location: truncateText(entry?.location, 20),
+                key: truncateText(entry?.key, 40),
+                value: truncateText(entry?.value, isGroq ? 40 : 80)
+              }))
+              : []
+          }
+        : { safe: [], controlled_mutation: [], high_risk: [] },
+      execution_guards: Array.isArray(record.execution_guards)
+        ? record.execution_guards.slice(0, 4).map(entry => truncateText(entry, isGroq ? 80 : 130))
+        : [],
       prompt_hints: Array.isArray(record.prompt_hints) ? record.prompt_hints.slice(0, 2).map(entry => truncateText(entry, isGroq ? 80 : 140)) : [],
       matched_terms: Array.isArray(record.matched_terms) ? record.matched_terms.slice(0, 6).map(entry => truncateText(entry, 60)) : [],
       safety_profile: truncateText(record.safety_profile, 32),
@@ -1682,7 +1716,13 @@ function compactSecurityContext(context, provider) {
       method: truncateText(entry?.method, 12),
       url: truncateText(entry?.url, 220),
       status: Number(entry?.status || 0),
-      finding: truncateText(entry?.finding, historyFindingLimit)
+      finding: truncateText(entry?.finding, historyFindingLimit),
+      drift: entry?.drift && typeof entry.drift === 'object'
+        ? {
+            status_delta: truncateText(entry.drift.status_delta, 24),
+            newly_leaked: Array.isArray(entry.drift.newly_leaked) ? entry.drift.newly_leaked.slice(0, 4).map(value => truncateText(value, 40)) : []
+          }
+        : null
     })),
     user_instruction: truncateText(context?.user_instruction, instructLimit)
   };
@@ -1961,7 +2001,67 @@ function parseAgentPayload(raw) {
   };
 }
 
-function parseSecurityPayload(raw) {
+function computeEvidenceConfidenceAndDelta(finding, context = {}) {
+  const evidence = String(finding?.evidence || '').trim();
+  const lowerEvidence = evidence.toLowerCase();
+  const lastResponse = context?.last_response && typeof context.last_response === 'object'
+    ? context.last_response
+    : null;
+  const bodyPreview = String(lastResponse?.body_preview || '');
+  const bodyLower = bodyPreview.toLowerCase();
+  const headers = lastResponse?.headers && typeof lastResponse.headers === 'object'
+    ? lastResponse.headers
+    : {};
+  const status = Number(lastResponse?.status || 0);
+  const previousStatuses = Array.isArray(context?.test_history)
+    ? context.test_history.map(entry => Number(entry?.status || 0)).filter(Number.isFinite)
+    : [];
+  const previousStatus = previousStatuses.length ? previousStatuses[previousStatuses.length - 1] : 0;
+
+  let score = 0.2;
+  const deltas = [];
+  if (evidence) score += 0.15;
+  if (evidence && bodyLower.includes(lowerEvidence) && lowerEvidence.length > 3) {
+    score += 0.42;
+    deltas.push(`body_delta: found evidence snippet "${evidence.slice(0, 120)}"`);
+  } else if (evidence && lowerEvidence.split(/\s+/).filter(Boolean).some(token => token.length > 4 && bodyLower.includes(token))) {
+    score += 0.2;
+    deltas.push('body_delta: partial evidence token overlap with response preview');
+  }
+
+  if (evidence && /status\s*[=:]?\s*(\d{3})/.test(lowerEvidence)) {
+    const mention = Number(lowerEvidence.match(/status\s*[=:]?\s*(\d{3})/)?.[1] || 0);
+    if (mention && mention === status) {
+      score += 0.15;
+      deltas.push(`status_delta: evidence matches current status ${status}`);
+    }
+  }
+
+  const headerPairs = Object.entries(headers);
+  if (headerPairs.length && evidence) {
+    const headerHit = headerPairs.find(([key, value]) => lowerEvidence.includes(String(key).toLowerCase()) || lowerEvidence.includes(String(value).toLowerCase()));
+    if (headerHit) {
+      score += 0.12;
+      deltas.push(`header_delta: evidence references header ${String(headerHit[0]).toLowerCase()}`);
+    }
+  }
+
+  if (status && previousStatus && status !== previousStatus) {
+    score += 0.08;
+    deltas.push(`status_transition: ${previousStatus} -> ${status}`);
+  }
+
+  const confidence = Number(Math.max(0.05, Math.min(0.99, score)).toFixed(2));
+  const evidenceDelta = deltas.length
+    ? deltas.join(' | ')
+    : 'delta_unavailable: evidence inferred from model output only';
+  return {
+    confidence,
+    evidence_delta: evidenceDelta
+  };
+}
+
+function parseSecurityPayload(raw, options = {}) {
   const parsed = parseJsonObjectLoose(raw);
 
   if (!isNonEmptyString(parsed.message)) {
@@ -2007,10 +2107,16 @@ function parseSecurityPayload(raw) {
     throw err;
   }
 
+  const context = options?.context && typeof options.context === 'object' ? options.context : {};
+  const enrichedFindings = normalizedFindings.map(finding => ({
+    ...finding,
+    ...computeEvidenceConfidenceAndDelta(finding, context)
+  }));
+
   return {
     message: parsed.message,
     threat_level: parsed.threat_level,
-    findings: normalizedFindings,
+    findings: enrichedFindings,
     actions: normalizedActions
   };
 }
@@ -2057,6 +2163,7 @@ function parseAssertionsPayload(raw, options = {}) {
 const ASSERTIONS_MODES = new Set(['functional', 'security', 'contract']);
 const ASSERTION_STRICTNESS = new Set(['balanced', 'strict', 'aggressive']);
 const ASSERTION_AUTH_EXPECTATIONS = new Set(['auto', 'required', 'optional']);
+const ASSERTION_POLICY_PACKS = new Set(['auto', 'none', 'owasp-api-2023', 'asvs-lite', 'internal-baseline']);
 
 function normalizeAssertionsMode(raw) {
   const m = typeof raw === 'string' ? raw.toLowerCase().trim() : '';
@@ -2067,11 +2174,13 @@ function normalizeAssertionPreferences(raw) {
   const source = raw && typeof raw === 'object' ? raw : {};
   const strictness = ASSERTION_STRICTNESS.has(source.strictness) ? source.strictness : 'balanced';
   const authExpectation = ASSERTION_AUTH_EXPECTATIONS.has(source.auth_expectation) ? source.auth_expectation : 'auto';
+  const policyPack = ASSERTION_POLICY_PACKS.has(source.policy_pack) ? source.policy_pack : 'auto';
   return {
     strictness,
     auth_expectation: authExpectation,
     include_negative_checks: source.include_negative_checks !== false,
-    include_timing_checks: Boolean(source.include_timing_checks)
+    include_timing_checks: Boolean(source.include_timing_checks),
+    policy_pack: policyPack
   };
 }
 
@@ -2106,14 +2215,17 @@ function buildAssertionsInstructionText(mode, preferences = {}) {
     : preferences.auth_expectation === 'optional'
       ? 'Do not force auth-specific assertions unless the response already proves auth enforcement.'
       : 'Infer whether auth assertions are appropriate from the request and response.';
+  const policyInstruction = preferences.policy_pack && preferences.policy_pack !== 'none'
+    ? `Align generated assertions with policy pack: ${preferences.policy_pack}.`
+    : 'No policy pack constraints.';
 
   switch (mode) {
     case 'security':
-      return `Generate ${countHint} security assertions as JS expressions. Cover status/auth expectations, sensitive-data leakage checks, verbose error guards, and one response-shape check. ${negativeInstruction} ${timingInstruction} ${authInstruction}`;
+      return `Generate ${countHint} security assertions as JS expressions. Cover status/auth expectations, sensitive-data leakage checks, verbose error guards, and one response-shape check. ${negativeInstruction} ${timingInstruction} ${authInstruction} ${policyInstruction}`;
     case 'contract':
-      return `Generate ${countHint} contract assertions validating required fields, response shape, field types, and schema expectations. Use exact field names from the response or expected_schema. ${timingInstruction}`;
+      return `Generate ${countHint} contract assertions validating required fields, response shape, field types, and schema expectations. Use exact field names from the response or expected_schema. ${timingInstruction} ${policyInstruction}`;
     default:
-      return `Generate ${countHint} functional assertions. Cover status, shape or field existence, one value or type check, and one negative guard. Use exact response fields instead of generic placeholders. ${negativeInstruction} ${timingInstruction} ${authInstruction}`;
+      return `Generate ${countHint} functional assertions. Cover status, shape or field existence, one value or type check, and one negative guard. Use exact response fields instead of generic placeholders. ${negativeInstruction} ${timingInstruction} ${authInstruction} ${policyInstruction}`;
   }
 }
 
@@ -2316,6 +2428,7 @@ app.post('/api/assertions', async (req, res) => {
       mode,
       instruction: buildAssertionsInstructionText(mode, preferences),
       preferences,
+      policy_pack: preferences.policy_pack,
       assertion_goals: assertionGoals,
       ...(expectedSchema !== undefined && expectedSchema !== null ? { expected_schema: expectedSchema } : {}),
       current_request: {
@@ -2420,12 +2533,30 @@ app.post('/api/assertions', async (req, res) => {
       maxAttempts: 3
     });
 
+    const selectedPolicyPackId = securityPolicyPacks.inferPolicyPackId({
+      current_request: currentRequest
+    }, preferences.policy_pack);
+    const selectedPolicyPack = securityPolicyPacks.getPolicyPack(selectedPolicyPackId);
+    const mergedAssertions = securityPolicyPacks.mergePolicyAssertions(
+      repaired.payload.assertions,
+      selectedPolicyPack ? selectedPolicyPack.assertions : []
+    );
+    const mergedSemantic = validateGeneratedAssertions(mergedAssertions, {
+      mode,
+      parsedJson: tryParseJson(typeof bodyPreview === 'string' ? bodyPreview : ''),
+      expectedSchema,
+      preferences
+    });
+    const finalAssertions = mergedSemantic.ok ? mergedAssertions : repaired.payload.assertions;
+
     return res.json({
-      assertions: repaired.payload.assertions,
+      assertions: finalAssertions,
       mode,
       diagnostics: {
         ...repaired.diagnostics,
         engine: 'assertions',
+        policy_pack: selectedPolicyPackId,
+        policy_pack_applied: Boolean(selectedPolicyPack && mergedSemantic.ok),
         provider: initialResult.provider,
         model: initialResult.model,
         requested_provider: provider,
@@ -2532,7 +2663,7 @@ app.post('/api/security-agent', async (req, res) => {
     const initialResult = await runSecurityGeneration({});
     const repaired = await parseWithRepairLoop({
       initialRaw: initialResult.raw,
-      parseFn: raw => validateSecurityPayloadSemantics(parseSecurityPayload(raw), compactedSecurityContext),
+      parseFn: raw => validateSecurityPayloadSemantics(parseSecurityPayload(raw, { context: compactedSecurityContext }), compactedSecurityContext),
       buildRepairInput: ({ error, raw, attempt }) => {
         const planningHint = compactedSecurityContext.current_mode === 'planning'
           ? '\nPlanning mode is active. You MUST return a scan_plan as the first action with non-empty steps.'
@@ -2709,6 +2840,7 @@ app.__internals = {
   normalizeAssertionPreferences,
   buildAssertionsInstructionText,
   parseAssertionsPayload,
+  parseSecurityPayload,
   validateSecurityPayloadSemantics,
   validateGeneratedAssertions,
   compactSecurityContext,

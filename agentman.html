@@ -78,6 +78,7 @@
       <div class="tab" data-tab="env">Env</div>
       <div class="tab" data-tab="assertions">Assertions <span class="tab-badge" id="assertion-count">0</span></div>
       <div class="tab" data-tab="snapshots">Snapshots</div>
+      <div class="tab" data-tab="reports">Report</div>
     </div>
 
     <div class="editor-area">
@@ -151,6 +152,14 @@
               <option value="required">Expect auth required</option>
               <option value="optional">Auth optional</option>
             </select>
+            <label for="assertion-gen-policy" class="assertions-label">Policy</label>
+            <select id="assertion-gen-policy" class="assertion-gen-select">
+              <option value="auto">Auto</option>
+              <option value="none">None</option>
+              <option value="owasp-api-2023">OWASP API 2023</option>
+              <option value="asvs-lite">ASVS-lite</option>
+              <option value="internal-baseline">Internal baseline</option>
+            </select>
           </div>
           <div class="assertions-toolbar-row">
             <label class="assertions-label"><input type="checkbox" id="assertion-gen-negative" checked /> Include negative checks</label>
@@ -167,6 +176,31 @@
       <!-- Snapshots (Regression) -->
       <div class="tab-content" id="tab-snapshots">
         <div id="snapshots-panel"></div>
+      </div>
+
+      <div class="tab-content" id="tab-reports">
+        <div class="report-tab-toolbar">
+          <div class="report-tab-row">
+            <label class="assertions-label" for="report-run-filter">Run</label>
+            <select id="report-run-filter" class="assertion-gen-select"></select>
+            <label class="assertions-label" for="report-vector-filter">Vector</label>
+            <select id="report-vector-filter" class="assertion-gen-select"></select>
+            <label class="assertions-label" for="report-severity-filter">Severity</label>
+            <select id="report-severity-filter" class="assertion-gen-select">
+              <option value="all">All</option>
+              <option value="info">Info</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="critical">Critical</option>
+            </select>
+          </div>
+          <div class="report-tab-row">
+            <button type="button" class="send-btn assertion-gen-btn" onclick="openSecurityReportPage()">Open full report page</button>
+          </div>
+          <p class="assertions-hint">Reports open as a dedicated page and apply the selected run/vector/severity filters to exports.</p>
+        </div>
+        <div id="report-tab-preview" class="report-tab-preview"></div>
       </div>
     </div>
 

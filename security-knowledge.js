@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const securityPayloadPacks = require('./security-payload-packs');
 
 const DATASET_PATH = path.join(__dirname, 'security-cve-dataset.json');
 
@@ -168,6 +169,7 @@ function scoreFamily(family, tokenCounts, responseClues, method, patternBoost) {
 }
 
 function summarizeFamily(family, scoreResult) {
+  const payloadPack = securityPayloadPacks.resolvePayloadPackForFamily(family.family_id);
   return {
     family_id: family.family_id,
     family: family.family,
@@ -181,6 +183,8 @@ function summarizeFamily(family, scoreResult) {
     safe_detection_templates: Array.isArray(family.safe_detection_templates) ? family.safe_detection_templates.slice(0, 3) : [],
     mutation_risk_templates: Array.isArray(family.mutation_risk_templates) ? family.mutation_risk_templates.slice(0, 3) : [],
     negative_assertion_templates: Array.isArray(family.negative_assertion_templates) ? family.negative_assertion_templates.slice(0, 3) : [],
+    payload_packs: payloadPack,
+    execution_guards: Array.isArray(payloadPack.execution_guards) ? payloadPack.execution_guards.slice(0, 6) : [],
     cve_examples: Array.isArray(family.cve_examples) ? family.cve_examples.slice(0, 3) : [],
     matched_terms: scoreResult.matchedTerms.slice(0, 8),
     score: scoreResult.score,

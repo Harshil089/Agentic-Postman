@@ -78,6 +78,10 @@ let securityTestHistory = [];
 let securityThreatLevel = 'none';
 let matchedSecurityKnowledge = [];
 let securityKnowledgeExpanded = false;
+let securityRunReport = {
+  runs: [],
+  activeRunId: null
+};
 let activeSidebarWindow = 'requests';
 let errorLogEntries = [];
 let structuredDiagnosticsEntries = [];
@@ -129,7 +133,8 @@ const STORAGE_KEYS = {
   sidebarWindow: 'agentman:sidebarWindow',
   scanPaceMs: 'agentman:scanPaceMs',
   scanPaceSetting: 'agentman:scanPaceSetting',
-  workspace: 'agentman:workspace'
+  workspace: 'agentman:workspace',
+  securityReport: 'agentman:securityRunReport'
 };
 
 const SCAN_PACE_VALUES = new Set(['0', '2000', '5000', '8000', 'adaptive']);
@@ -261,6 +266,29 @@ function normalizeGenericLogEntries(entries) {
   return Array.isArray(entries) ? entries.map(entry => cloneSerializable(entry)).filter(Boolean) : [];
 }
 
+function normalizeSecurityRunReport(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const runs = Array.isArray(source.runs)
+    ? source.runs
+      .filter(run => run && typeof run === 'object')
+      .map((run, index) => ({
+        id: typeof run.id === 'string' && run.id.trim() ? run.id : `run_${Date.now()}_${index}`,
+        startedAt: typeof run.startedAt === 'string' ? run.startedAt : new Date().toISOString(),
+        endedAt: typeof run.endedAt === 'string' ? run.endedAt : null,
+        status: typeof run.status === 'string' ? run.status : 'completed',
+        mode: typeof run.mode === 'string' ? run.mode : 'agent',
+        target: typeof run.target === 'string' ? run.target : '',
+        instruction: typeof run.instruction === 'string' ? run.instruction : '',
+        timeline: normalizeGenericLogEntries(run.timeline).slice(-300),
+        findings: normalizeGenericLogEntries(run.findings).slice(-300),
+        lineage: normalizeGenericLogEntries(run.lineage).slice(-300)
+      }))
+      .slice(-25)
+    : [];
+  const activeRunId = typeof source.activeRunId === 'string' ? source.activeRunId : null;
+  return { runs, activeRunId };
+}
+
 function normalizeHistoryEntry(entry) {
   const source = entry && typeof entry === 'object' ? entry : {};
   const requestSnapshot = normalizeRequestRecord(source.requestSnapshot || source.request || {}, Number(source.requestId || 1));
@@ -326,6 +354,7 @@ function buildWorkspaceState() {
     chatGoal,
     conversationHistory: cloneSerializable(conversationHistory) || [],
     securityTestHistory: cloneSerializable(securityTestHistory) || [],
+    securityRunReport: cloneSerializable(securityRunReport) || { runs: [], activeRunId: null },
     errorLogEntries: cloneSerializable(errorLogEntries) || [],
     structuredDiagnosticsEntries: cloneSerializable(structuredDiagnosticsEntries) || [],
     requestHistoryEntries: cloneSerializable(requestHistoryEntries) || [],
@@ -347,9 +376,16 @@ function buildWorkspaceState() {
   };
 }
 
+function persistSecurityRunReport() {
+  try {
+    localStorage.setItem(STORAGE_KEYS.securityReport, JSON.stringify(securityRunReport));
+  } catch {}
+}
+
 function saveWorkspaceState() {
   try {
     localStorage.setItem(STORAGE_KEYS.workspace, JSON.stringify(buildWorkspaceState()));
+    persistSecurityRunReport();
   } catch {}
 }
 
@@ -381,6 +417,7 @@ function loadWorkspaceState() {
     chatGoal = typeof stored.chatGoal === 'string' ? stored.chatGoal : chatGoal;
     conversationHistory = normalizeConversationEntries(stored.conversationHistory).slice(-40);
     securityTestHistory = normalizeGenericLogEntries(stored.securityTestHistory).slice(-80);
+    securityRunReport = normalizeSecurityRunReport(stored.securityRunReport);
     errorLogEntries = normalizeGenericLogEntries(stored.errorLogEntries).slice(-200);
     structuredDiagnosticsEntries = normalizeGenericLogEntries(stored.structuredDiagnosticsEntries).slice(-200);
     requestHistoryEntries = Array.isArray(stored.requestHistoryEntries)
@@ -530,6 +567,18 @@ function loadModelPreferences() {
       if (Number.isFinite(storedScanPaceMs) && SCAN_PACE_VALUES.has(String(storedScanPaceMs))) {
         scanPaceSetting = String(storedScanPaceMs);
       }
+    }
+  } catch {}
+}
+
+function loadSecurityRunReportFallback() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.securityReport);
+    if (!raw) return;
+    const parsed = parseJsonSafely(raw);
+    const normalized = normalizeSecurityRunReport(parsed);
+    if (normalized.runs.length) {
+      securityRunReport = normalized;
     }
   } catch {}
 }
@@ -1540,8 +1589,10 @@ function startNewChat() {
   securityThreatLevel = 'none';
   matchedSecurityKnowledge = [];
   securityKnowledgeExpanded = false;
+  securityRunReport = { runs: [], activeRunId: null };
   resetScanProgress('No active scan');
   renderSecurityKnowledgePanel();
+  renderReportTabPreview();
   renderWelcomeMessage();
   loadComponentIntegrationPrompt();
   addAgentMsg('system', `Started new chat context (session ${chatSessionId}).`);
@@ -1632,6 +1683,166 @@ function finalizeScanProgress(status, detail) {
   }
   scanProgressState.lastFinishedAt = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   renderScanProgress();
+}
+
+function isDisposableTarget(url) {
+  const value = String(url || '').trim();
+  if (!value) return false;
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.toLowerCase();
+    return host === 'localhost'
+      || host === '127.0.0.1'
+      || host.endsWith('.local')
+      || host.includes('staging')
+      || host.includes('dev')
+      || host.includes('test');
+  } catch {
+    return false;
+  }
+}
+
+function classifyProbeSafetyTier(action) {
+  const method = String(action?.method || 'GET').toUpperCase();
+  const body = String(action?.body || '').toLowerCase();
+  const queryText = `${String(action?.url || '')} ${(action?.params || []).map(p => `${p.k}=${p.v}`).join(' ')}`.toLowerCase();
+  const highRiskSignals = ['drop table', 'xp_cmdshell', '__proto__', 'constructor.prototype', 'file://', '/etc/passwd'];
+  const controlledSignals = ['sleep(', '$where', 'isadmin', 'role', 'permissions', 'delete', 'patch'];
+
+  if (highRiskSignals.some(token => body.includes(token) || queryText.includes(token))) return 'high-risk';
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) return 'controlled-mutation';
+  if (controlledSignals.some(token => body.includes(token) || queryText.includes(token))) return 'controlled-mutation';
+  return 'safe';
+}
+
+function getExecutionGuardsForVector(vector) {
+  const records = Array.isArray(matchedSecurityKnowledge) ? matchedSecurityKnowledge : [];
+  const match = records.find(entry => {
+    const familyText = `${entry?.family || ''} ${entry?.title || ''}`.toLowerCase();
+    return vector && familyText.includes(String(vector).toLowerCase().replace(/[^a-z]/g, ''));
+  });
+  return Array.isArray(match?.execution_guards) ? match.execution_guards : [];
+}
+
+function summarizeResponseDrift(previousResponse, currentResponse) {
+  const prevStatus = Number(previousResponse?.status || 0);
+  const nextStatus = Number(currentResponse?.status || 0);
+  const prevText = String(previousResponse?.text || previousResponse?.body || '').toLowerCase();
+  const nextText = String(currentResponse?.text || currentResponse?.body || '').toLowerCase();
+  const statusDelta = prevStatus && nextStatus && prevStatus !== nextStatus
+    ? `${prevStatus}->${nextStatus}`
+    : prevStatus || nextStatus
+      ? `${nextStatus || prevStatus}`
+      : 'n/a';
+  const leakTerms = ['password', 'token', 'secret', 'stack trace', 'sql', 'exception', 'traceback'];
+  const newlyLeaked = leakTerms.filter(term => !prevText.includes(term) && nextText.includes(term));
+  const removedLeaks = leakTerms.filter(term => prevText.includes(term) && !nextText.includes(term));
+  return {
+    status_delta: statusDelta,
+    newly_leaked: newlyLeaked,
+    removed_leaks: removedLeaks,
+    elapsed_ms: Number(currentResponse?.elapsed || currentResponse?.elapsed_ms || 0)
+  };
+}
+
+function startSecurityRunReport(input = {}) {
+  const run = {
+    id: `run_${Date.now()}`,
+    startedAt: new Date().toISOString(),
+    endedAt: null,
+    status: 'running',
+    mode: agentMode,
+    target: String(input.target || ''),
+    instruction: String(input.instruction || ''),
+    timeline: [],
+    findings: [],
+    lineage: []
+  };
+  securityRunReport.runs.push(run);
+  securityRunReport.activeRunId = run.id;
+  if (securityRunReport.runs.length > 25) {
+    securityRunReport.runs = securityRunReport.runs.slice(-25);
+  }
+  saveWorkspaceState();
+  renderReportTabPreview();
+  return run;
+}
+
+function getActiveSecurityRun() {
+  const id = securityRunReport.activeRunId;
+  if (!id) return null;
+  return securityRunReport.runs.find(run => run.id === id) || null;
+}
+
+function appendSecurityRunEvent(type, details = {}) {
+  const run = getActiveSecurityRun();
+  if (!run) return;
+  run.timeline.push({
+    at: new Date().toISOString(),
+    type,
+    details
+  });
+  if (type === 'finding' && details && typeof details === 'object') {
+    run.findings.push(details);
+  }
+  if (type === 'probe' && details && typeof details === 'object') {
+    run.lineage.push({
+      at: new Date().toISOString(),
+      method: details.method || 'GET',
+      url: details.url || '',
+      vector: details.vector || 'Unknown',
+      tier: details.tier || 'safe',
+      status: Number(details.status || 0),
+      drift: details.drift || null
+    });
+  }
+  saveWorkspaceState();
+  renderReportTabPreview();
+}
+
+function finalizeSecurityRunReport(status = 'completed') {
+  const run = getActiveSecurityRun();
+  if (!run) return;
+  run.status = status;
+  run.endedAt = new Date().toISOString();
+  securityRunReport.activeRunId = null;
+  saveWorkspaceState();
+  renderReportTabPreview();
+}
+
+function toReadableTime(iso) {
+  if (!iso) return 'n/a';
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return 'n/a';
+  return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function buildSecurityRunMarkdown(run) {
+  const lines = [
+    `# Security Run Report`,
+    ``,
+    `- Run ID: ${run.id}`,
+    `- Mode: ${run.mode}`,
+    `- Target: ${run.target || 'n/a'}`,
+    `- Status: ${run.status}`,
+    `- Started: ${run.startedAt}`,
+    `- Ended: ${run.endedAt || 'n/a'}`,
+    ``
+  ];
+  lines.push('## Probe Lineage');
+  if (!run.lineage.length) lines.push('- none');
+  run.lineage.forEach(item => {
+    lines.push(`- [${item.at}] ${item.method} ${item.url} vector=${item.vector} tier=${item.tier} status=${item.status}`);
+    if (item.drift) lines.push(`  drift: status_delta=${item.drift.status_delta}; newly_leaked=${(item.drift.newly_leaked || []).join(',') || 'none'}`);
+  });
+  lines.push('', '## Findings');
+  if (!run.findings.length) lines.push('- none');
+  run.findings.forEach(finding => {
+    lines.push(`- ${finding.id || 'FINDING'} ${finding.vulnerability || 'Unknown'} severity=${finding.severity || 'info'} confidence=${finding.confidence ?? 'n/a'}`);
+    lines.push(`  evidence: ${finding.evidence || 'n/a'}`);
+    lines.push(`  evidence_delta: ${finding.evidence_delta || 'n/a'}`);
+  });
+  return lines.join('\n');
 }
 
 // TABS
@@ -1918,6 +2129,9 @@ function normalizeSecurityAction(action) {
       params: normalizeKVList(action.params),
       body: typeof action.body === 'string' ? action.body : '',
       vector: typeof action.vector === 'string' ? action.vector : 'Unknown',
+      safety_tier: ['safe', 'controlled-mutation', 'high-risk'].includes(String(action.safety_tier || ''))
+        ? String(action.safety_tier)
+        : 'safe',
       hypothesis: typeof action.hypothesis === 'string' ? action.hypothesis : '',
       auto_chain: Boolean(action.auto_chain)
     };
@@ -2026,12 +2240,15 @@ function renderSecurityFindings(findings, threatLevel) {
     const id = escHtml(item.id || 'FINDING');
     const name = escHtml(item.vulnerability || 'Unknown');
     const sev = escHtml(item.severity || 'info');
+    const confidence = Number(item.confidence);
+    const confidenceLabel = Number.isFinite(confidence) ? ` · confidence ${(confidence * 100).toFixed(0)}%` : '';
     const owasp = item.owasp_api_label
       ? `<br><span class="security-owasp-label">OWASP: ${escHtml(item.owasp_api_label)}</span>`
       : '';
     const evidence = escHtml(item.evidence || 'No evidence supplied');
+    const evidenceDelta = escHtml(item.evidence_delta || 'delta_unavailable');
     const remediation = escHtml(item.remediation || 'No remediation supplied');
-    return `<strong>${id} · ${name} (${sev})</strong>${owasp}<br>Evidence: ${evidence}<br>Fix: ${remediation}`;
+    return `<strong>${id} · ${name} (${sev}${confidenceLabel})</strong>${owasp}<br>Evidence: ${evidence}<br>Evidence delta: ${evidenceDelta}<br>Fix: ${remediation}`;
   });
 
   addAgentMsg('agent', `<strong>Threat level:</strong> ${escHtml(String(threatLevel || 'none').toUpperCase())}<br><br>${lines.join('<br><br>')}`);
@@ -2065,7 +2282,11 @@ function renderFuzzList(action) {
 
 function appendSecurityHistory(entry) {
   if (!entry || typeof entry !== 'object') return;
-  securityTestHistory.push(entry);
+  securityTestHistory.push({
+    ...entry,
+    at: entry.at || new Date().toISOString(),
+    vector: entry.vector || entry.finding || 'Probe'
+  });
   if (securityTestHistory.length > 80) {
     securityTestHistory = securityTestHistory.slice(-80);
   }
@@ -2440,33 +2661,75 @@ async function executeSecurityProbe(action, options = {}) {
     skipApplyMessage = true,
     sourceLabel = 'security'
   } = options;
+  const tier = ['safe', 'controlled-mutation', 'high-risk'].includes(String(action?.safety_tier || ''))
+    ? String(action.safety_tier)
+    : classifyProbeSafetyTier(action);
+  const guards = getExecutionGuardsForVector(action.vector);
+  const riskHeader = `Tier: ${tier}\nVector: ${action.vector || 'Unknown'}\nURL: ${action.url}`;
+
+  if (tier === 'high-risk' && !isDisposableTarget(action.url)) {
+    addAgentMsg('error', `Blocked high-risk probe outside disposable targets.\n${riskHeader}`);
+    appendSecurityRunEvent('guard_block', {
+      method: action.method,
+      url: action.url,
+      vector: action.vector || 'Unknown',
+      tier,
+      reason: 'non-disposable-target'
+    });
+    return { executed: false, skipped: true, response: null };
+  }
 
   if (forceConfirmNonGet && requiresMutationConfirmation(action.method)) {
+    const guardText = guards.length ? `\n\nExecution guards:\n- ${guards.join('\n- ')}` : '';
     const proceed = window.confirm(
-      `This probe uses ${action.method} and may modify remote state.\n\nVector: ${action.vector || 'Unknown'}\nURL: ${action.url}\n\nContinue?`
+      `This probe uses ${action.method} and may modify remote state.\n\n${riskHeader}${guardText}\n\nContinue?`
     );
     if (!proceed) {
       appendSecurityHistory({
         method: action.method,
         url: action.url,
         status: 0,
-        finding: `${action.vector || 'Probe'} skipped by user (${sourceLabel})`
+        finding: `${action.vector || 'Probe'} skipped by user (${sourceLabel})`,
+        tier
       });
       addAgentMsg('system', `Skipped ${action.method} probe for ${action.vector || 'Unknown'} after confirmation prompt.`);
+      appendSecurityRunEvent('guard_skip', {
+        method: action.method,
+        url: action.url,
+        vector: action.vector || 'Unknown',
+        tier
+      });
       return { executed: false, skipped: true, response: null };
     }
   }
 
+  const previousResponse = lastResponse ? {
+    status: Number(lastResponse.status || 0),
+    text: String(lastResponse.text || ''),
+    elapsed: Number(lastResponse.elapsed || 0)
+  } : null;
   applyProbeAction(action, { skipMessage: skipApplyMessage });
   const response = await sendRequest({
     confirmMutation: !['GET', 'HEAD', 'OPTIONS'].includes(String(action.method || '').toUpperCase()),
     skipAutoAssertions: true
   });
+  const drift = response ? summarizeResponseDrift(previousResponse, response) : null;
   appendSecurityHistory({
     method: action.method,
     url: action.url,
     status: response?.status || 0,
-    finding: action.vector || 'Probe'
+    finding: action.vector || 'Probe',
+    tier,
+    drift
+  });
+  appendSecurityRunEvent('probe', {
+    method: action.method,
+    url: action.url,
+    vector: action.vector || 'Unknown',
+    tier,
+    status: response?.status || 0,
+    drift,
+    source: sourceLabel
   });
   return { executed: Boolean(response), skipped: false, response };
 }
@@ -2544,6 +2807,13 @@ async function generateProbeForScanStep(scanPlan, planStep) {
     `Generate exactly one probe for scan plan step ${planStep.order || '?'} on target ${scanPlan.target || r.url}.`,
     `Vector: ${planStep.vector || 'Unknown'}.`,
     `Step description: ${planStep.description || 'n/a'}.`,
+    `Recent response drift: ${(securityTestHistory || []).slice(-3).map(entry => {
+      const delta = entry?.drift?.status_delta || 'n/a';
+      const leaks = Array.isArray(entry?.drift?.newly_leaked) && entry.drift.newly_leaked.length
+        ? entry.drift.newly_leaked.join(',')
+        : 'none';
+      return `${entry?.vector || entry?.finding || 'probe'} status_delta=${delta} leaks=${leaks}`;
+    }).join(' | ') || 'none'}.`,
     'Return one action only, prioritizing type "probe". If not possible, return one "probe_chain".'
   ].join(' ');
 
@@ -2631,6 +2901,10 @@ async function executeScanPlan(scanPlan) {
 
   startScanProgress(steps.length, scanPlan.target || 'Current endpoint');
   addAgentMsg('system', `Running scan plan with ${steps.length} step(s).`);
+  appendSecurityRunEvent('scan_plan_start', {
+    target: scanPlan.target || '',
+    steps: steps.length
+  });
 
   for (let i = 0; i < steps.length; i += 1) {
     const planStep = steps[i];
@@ -2655,6 +2929,11 @@ async function executeScanPlan(scanPlan) {
 
     updateScanProgressStep(i + 1, steps.length, planStep.vector || 'Unknown');
     addAgentMsg('system', `Preparing step ${planStep.order || '?'} (${planStep.vector || 'Unknown'}).`);
+    appendSecurityRunEvent('scan_step_prepare', {
+      order: planStep.order || i + 1,
+      vector: planStep.vector || 'Unknown',
+      description: planStep.description || ''
+    });
 
     let generated;
     try {
@@ -2665,6 +2944,11 @@ async function executeScanPlan(scanPlan) {
     } catch (error) {
       addAgentMsg('error', `Failed to generate probe for step ${planStep.order || '?'}: ${error.message}`);
       scanProgressState.failed += 1;
+      appendSecurityRunEvent('scan_step_error', {
+        order: planStep.order || i + 1,
+        vector: planStep.vector || 'Unknown',
+        error: error.message
+      });
       finalizeScanProgress('failed', `Generation failed at step ${i + 1}/${steps.length}`);
       return false;
     }
@@ -2685,12 +2969,20 @@ async function executeScanPlan(scanPlan) {
       });
       if (result.skipped) {
         scanProgressState.skipped += 1;
+        appendSecurityRunEvent('scan_step_skipped', {
+          order: planStep.order || i + 1,
+          vector: planStep.vector || 'Unknown'
+        });
         finalizeScanProgress('stopped', `Skipped at step ${i + 1}/${steps.length}`);
         return false;
       }
       if (!result.executed) {
         addAgentMsg('system', `Step ${planStep.order || '?'} did not execute successfully.`);
         scanProgressState.failed += 1;
+        appendSecurityRunEvent('scan_step_failed', {
+          order: planStep.order || i + 1,
+          vector: planStep.vector || 'Unknown'
+        });
         finalizeScanProgress('failed', `Execution failed at step ${i + 1}/${steps.length}`);
         return false;
       }
@@ -2711,6 +3003,10 @@ async function executeScanPlan(scanPlan) {
       });
       if (!ok) {
         scanProgressState.failed += 1;
+        appendSecurityRunEvent('scan_step_chain_failed', {
+          order: planStep.order || i + 1,
+          vector: planStep.vector || 'Unknown'
+        });
         finalizeScanProgress('failed', `Chain failed at step ${i + 1}/${steps.length}`);
         return false;
       }
@@ -2727,6 +3023,12 @@ async function executeScanPlan(scanPlan) {
 
   finalizeScanProgress('completed', `${steps.length}/${steps.length} steps completed`);
   addAgentMsg('system', 'Scan plan execution completed.');
+  appendSecurityRunEvent('scan_plan_complete', {
+    steps: steps.length,
+    passed: scanProgressState.passed,
+    failed: scanProgressState.failed,
+    skipped: scanProgressState.skipped
+  });
   return true;
 }
 
@@ -3162,9 +3464,11 @@ function collectAssertionGoalsFromUi() {
 }
 
 function collectAssertionPreferencesFromUi() {
+  const policyPack = document.getElementById('assertion-gen-policy')?.value || 'auto';
   return {
     strictness: document.getElementById('assertion-gen-strictness')?.value || 'balanced',
     auth_expectation: document.getElementById('assertion-gen-auth')?.value || 'auto',
+    policy_pack: ['auto', 'none', 'owasp-api-2023', 'asvs-lite', 'internal-baseline'].includes(policyPack) ? policyPack : 'auto',
     include_negative_checks: Boolean(document.getElementById('assertion-gen-negative')?.checked),
     include_timing_checks: Boolean(document.getElementById('assertion-gen-timing')?.checked)
   };
@@ -3178,6 +3482,95 @@ function parseExpectedSchemaFromUi() {
   } catch {
     throw new Error('expected_schema JSON is invalid.');
   }
+}
+
+function buildReportTabFilterState() {
+  return {
+    run: document.getElementById('report-run-filter')?.value || 'latest',
+    vector: document.getElementById('report-vector-filter')?.value || 'all',
+    severity: document.getElementById('report-severity-filter')?.value || 'all'
+  };
+}
+
+function renderReportTabFilters() {
+  const runEl = document.getElementById('report-run-filter');
+  const vectorEl = document.getElementById('report-vector-filter');
+  const severityEl = document.getElementById('report-severity-filter');
+  if (!runEl || !vectorEl || !severityEl) return;
+
+  const state = buildReportTabFilterState();
+  const runs = Array.isArray(securityRunReport.runs) ? securityRunReport.runs : [];
+  const runOptions = ['<option value="latest">Latest run</option>', '<option value="all">All runs</option>'];
+  runs.slice().reverse().forEach(run => {
+    runOptions.push(`<option value="${escHtml(run.id)}">${escHtml(`${run.id} (${run.status})`)}</option>`);
+  });
+  runEl.innerHTML = runOptions.join('');
+  runEl.value = runOptions.some(opt => opt.includes(`value="${state.run}"`)) ? state.run : 'latest';
+
+  const vectors = new Set(['all']);
+  runs.forEach(run => (run.lineage || []).forEach(item => vectors.add(String(item.vector || 'Unknown'))));
+  vectorEl.innerHTML = [...vectors].map(vector => `<option value="${escHtml(vector)}">${escHtml(vector === 'all' ? 'All vectors' : vector)}</option>`).join('');
+  if ([...vectors].includes(state.vector)) vectorEl.value = state.vector;
+
+  if (!['all', 'info', 'low', 'medium', 'high', 'critical'].includes(state.severity)) {
+    severityEl.value = 'all';
+  }
+}
+
+function getFilteredRunPreview() {
+  const filter = buildReportTabFilterState();
+  const runs = Array.isArray(securityRunReport.runs) ? securityRunReport.runs : [];
+  const selectedRuns = filter.run === 'all'
+    ? runs
+    : filter.run === 'latest'
+      ? (runs.length ? [runs[runs.length - 1]] : [])
+      : runs.filter(run => run.id === filter.run);
+
+  const filteredLineage = [];
+  const filteredFindings = [];
+  selectedRuns.forEach(run => {
+    (run.lineage || []).forEach(item => {
+      if (filter.vector !== 'all' && String(item.vector || 'Unknown') !== filter.vector) return;
+      filteredLineage.push(item);
+    });
+    (run.findings || []).forEach(item => {
+      if (filter.severity !== 'all' && String(item.severity || '').toLowerCase() !== filter.severity) return;
+      filteredFindings.push(item);
+    });
+  });
+  return {
+    runs: selectedRuns,
+    lineage: filteredLineage,
+    findings: filteredFindings
+  };
+}
+
+function renderReportTabPreview() {
+  const previewEl = document.getElementById('report-tab-preview');
+  if (!previewEl) return;
+  renderReportTabFilters();
+  const filtered = getFilteredRunPreview();
+  if (!filtered.runs.length) {
+    previewEl.innerHTML = 'No matching runs for current filters.';
+    return;
+  }
+  const latest = filtered.runs[filtered.runs.length - 1];
+  previewEl.innerHTML = [
+    `<strong>Selected runs:</strong> ${filtered.runs.length}`,
+    `<strong>Latest selected:</strong> ${escHtml(latest.id)} (${escHtml(latest.status)})`,
+    `<strong>Probe lineage items:</strong> ${filtered.lineage.length}`,
+    `<strong>Findings:</strong> ${filtered.findings.length}`
+  ].join('<br>');
+}
+
+function openSecurityReportPage() {
+  const filter = buildReportTabFilterState();
+  const params = new URLSearchParams({
+    run: filter.run,
+    vector: filter.vector,
+    severity: filter.severity
+  });
+  window.open(`/security-report.html?${params.toString()}`, '_blank', 'noopener');
 }
 
 async function generateAssertionsFromUi() {
@@ -3212,6 +3605,9 @@ function switchTab(name) {
   // Render snapshots panel when snapshots tab is shown
   if (name === 'snapshots') {
     renderSnapshotsPanel();
+  }
+  if (name === 'reports') {
+    renderReportTabPreview();
   }
 }
 
@@ -3616,8 +4012,18 @@ function renderSecurityKnowledgePanel(records = matchedSecurityKnowledge) {
     const sections = [
       ['Matched terms', Array.isArray(record.matched_terms) ? record.matched_terms : []],
       ['Safe detection probes', Array.isArray(record.safe_detection_templates) ? record.safe_detection_templates : []],
+      ['Safe payload pack', Array.isArray(record?.payload_packs?.safe)
+        ? record.payload_packs.safe.map(entry => `${entry.location}.${entry.key}=${entry.value}`)
+        : []],
       ['Mutation-risk probes', Array.isArray(record.mutation_risk_templates) ? record.mutation_risk_templates : []],
+      ['Controlled payload pack', Array.isArray(record?.payload_packs?.controlled_mutation)
+        ? record.payload_packs.controlled_mutation.map(entry => `${entry.location}.${entry.key}=${entry.value}`)
+        : []],
+      ['High-risk payload pack', Array.isArray(record?.payload_packs?.high_risk)
+        ? record.payload_packs.high_risk.map(entry => `${entry.location}.${entry.key}=${entry.value}`)
+        : []],
       ['Negative assertions', Array.isArray(record.negative_assertion_templates) ? record.negative_assertion_templates : []],
+      ['Execution guards', Array.isArray(record.execution_guards) ? record.execution_guards : []],
       ['Safe objectives', Array.isArray(record.safe_test_objectives) ? record.safe_test_objectives : []],
       ['CVE examples', cveExamples]
     ]
@@ -3662,10 +4068,19 @@ async function runSecurityAgent(initialUserMsg) {
   const seenProbeSignatures = new Set();
   let step = 0;
   let continueAutonomousRun = true;
+  let runStatus = 'completed';
+  const seedRequest = getActive();
+  startSecurityRunReport({
+    mode: agentMode,
+    target: seedRequest?.url || '',
+    instruction: initialUserMsg
+  });
 
+  try {
   while (continueAutonomousRun) {
     if (agentRunState.stopRequested) {
       addAgentMsg('system', 'Autonomous run stopped by user.');
+      runStatus = 'stopped';
       break;
     }
 
@@ -3714,6 +4129,7 @@ async function runSecurityAgent(initialUserMsg) {
 
     updateThreatLevel(parsed.threat_level);
     renderSecurityFindings(parsed.findings, securityThreatLevel);
+    parsed.findings.forEach(finding => appendSecurityRunEvent('finding', finding));
 
     normalizedActions.forEach(action => {
       if (action.type === 'scan_plan') {
@@ -3822,10 +4238,17 @@ async function runSecurityAgent(initialUserMsg) {
     }
     if (!didAutoSend) {
       addAgentMsg('system', 'Security run paused: no auto-executable probe returned. Use the action chips to continue.');
+      runStatus = 'stopped';
       break;
     }
 
     step += 1;
+  }
+  } catch (error) {
+    runStatus = 'failed';
+    throw error;
+  } finally {
+    finalizeSecurityRunReport(runStatus);
   }
 }
 
@@ -4296,6 +4719,7 @@ function resolveChainTemplate(url) {
   initFluidBackground();
   loadModelPreferences();
   loadWorkspaceState();
+  loadSecurityRunReportFallback();
   await loadRuntimeConfig();
   loadActive();
   renderWelcomeMessage();
@@ -4309,6 +4733,8 @@ function resolveChainTemplate(url) {
   renderAgentMode();
   syncAgentRunControls();
   renderScanProgress();
+  renderSecurityKnowledgePanel();
+  renderReportTabPreview();
 
   const importInput = document.getElementById('import-spec-input');
   if (importInput) {
@@ -4326,4 +4752,8 @@ function resolveChainTemplate(url) {
   if (assertionGenBtn) {
     assertionGenBtn.addEventListener('click', () => generateAssertionsFromUi());
   }
+  ['report-run-filter', 'report-vector-filter', 'report-severity-filter'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', () => renderReportTabPreview());
+  });
 })();

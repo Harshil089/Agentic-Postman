@@ -9,7 +9,9 @@
     "test": "jest --runInBand",
     "test:watch": "jest --watch",
     "lint": "eslint server.js app.js workspace-utils.js import-spec.js ai-contracts.js test/**/*.test.js",
-    "ci": "npm run lint && npm run test && npm audit --audit-level=high"
+    "ci": "npm run lint && npm run test && npm audit --audit-level=high",
+    "security:dataset:ingest": "node scripts/security-dataset/ingest.js",
+    "security:dataset:benchmark": "node scripts/security-dataset/benchmark.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

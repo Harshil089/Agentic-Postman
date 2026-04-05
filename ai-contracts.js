@@ -21,6 +21,7 @@
   ]);
   const SECURITY_THREAT_LEVELS = new Set(['none', 'low', 'medium', 'high', 'critical']);
   const SECURITY_FINDING_SEVERITIES = new Set(['info', 'low', 'medium', 'high', 'critical']);
+  const SECURITY_SAFETY_TIERS = new Set(['safe', 'controlled-mutation', 'high-risk']);
 
   function isNonEmptyString(value) {
     return typeof value === 'string' && value.trim().length > 0;
@@ -619,11 +620,14 @@
   function normalizeSecurityFinding(raw, index = 0) {
     if (!raw || typeof raw !== 'object') return null;
     if (!SECURITY_FINDING_SEVERITIES.has(raw.severity)) return null;
+    const confidence = Number(raw.confidence);
     return {
       id: isNonEmptyString(raw.id) ? raw.id.trim() : `FINDING-${String(index + 1).padStart(3, '0')}`,
       vulnerability: isNonEmptyString(raw.vulnerability) ? raw.vulnerability.trim() : 'Unknown',
       severity: raw.severity,
       evidence: typeof raw.evidence === 'string' ? raw.evidence : '',
+      evidence_delta: typeof raw.evidence_delta === 'string' ? raw.evidence_delta : '',
+      confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0.5,
       cve_hint: typeof raw.cve_hint === 'string' || raw.cve_hint === null ? raw.cve_hint : null,
       owasp_api_label: isNonEmptyString(raw.owasp_api_label) ? raw.owasp_api_label.trim() : null,
       remediation: typeof raw.remediation === 'string' ? raw.remediation : ''
@@ -655,6 +659,9 @@
           params: normalizeKVEntries(action.params),
           body: typeof action.body === 'string' ? action.body : '',
           vector,
+          safety_tier: SECURITY_SAFETY_TIERS.has(String(action.safety_tier || '').trim())
+            ? String(action.safety_tier).trim()
+            : 'safe',
           hypothesis: typeof action.hypothesis === 'string' ? action.hypothesis : '',
           auto_chain: Boolean(action.auto_chain)
         }

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgentMan Security Report</title>
+  <link rel="stylesheet" href="security-report.css" />
+</head>
+<body>
+  <main class="report-page">
+    <header class="report-header">
+      <div>
+        <h1>Security Run Report</h1>
+        <p id="report-header-summary">Loading report data…</p>
+      </div>
+      <div class="report-header-actions">
+        <button type="button" class="btn" id="back-btn">Back to AgentMan</button>
+        <button type="button" class="btn" id="export-json-btn">Export JSON</button>
+        <button type="button" class="btn" id="export-md-btn">Export Markdown</button>
+        <button type="button" class="btn" id="export-pdf-btn">Export PDF</button>
+      </div>
+    </header>
+
+    <section class="report-filters">
+      <label>
+        Run
+        <select id="report-run-filter"></select>
+      </label>
+      <label>
+        Vector
+        <select id="report-vector-filter"></select>
+      </label>
+      <label>
+        Severity
+        <select id="report-severity-filter">
+          <option value="all">All</option>
+          <option value="info">Info</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="critical">Critical</option>
+        </select>
+      </label>
+      <button type="button" class="btn btn-primary" id="apply-filter-btn">Apply filters</button>
+    </section>
+
+    <section class="report-kpis" id="report-kpis"></section>
+
+    <section class="report-grid">
+      <article class="card">
+        <h2>Timeline</h2>
+        <div id="timeline-list" class="list"></div>
+      </article>
+      <article class="card">
+        <h2>Probe Lineage</h2>
+        <div id="lineage-list" class="list"></div>
+      </article>
+      <article class="card">
+        <h2>Findings</h2>
+        <div id="findings-list" class="list"></div>
+      </article>
+    </section>
+  </main>
+
+  <script src="security-report.js"></script>
+</body>
+</html>

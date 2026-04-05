@@ -30,6 +30,8 @@ describe('security-knowledge', () => {
     expect(matches[0]).toHaveProperty('safe_detection_templates');
     expect(matches[0]).toHaveProperty('mutation_risk_templates');
     expect(matches[0]).toHaveProperty('negative_assertion_templates');
+    expect(matches[0]).toHaveProperty('payload_packs');
+    expect(matches[0]).toHaveProperty('execution_guards');
     expect(matches.some(record => record.family === 'authentication-bypass' || record.family === 'session-management')).toBe(true);
   });
 

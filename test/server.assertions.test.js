@@ -47,6 +47,19 @@ describe('server assertion internals', () => {
     expect(parsed.assertions).toHaveLength(4);
   });
 
+  test('normalizeAssertionPreferences includes policy pack', () => {
+    const app = loadApp();
+    const prefs = app.__internals.normalizeAssertionPreferences({
+      strictness: 'strict',
+      auth_expectation: 'required',
+      policy_pack: 'asvs-lite',
+      include_negative_checks: true,
+      include_timing_checks: false
+    });
+
+    expect(prefs.policy_pack).toBe('asvs-lite');
+  });
+
   test('validateGeneratedAssertions enforces timing when requested', () => {
     const app = loadApp();
     const result = app.__internals.validateGeneratedAssertions([
@@ -87,6 +100,8 @@ describe('server assertion internals', () => {
       expect(compacted.matched_cve_records[0]).toHaveProperty('safe_detection_templates');
       expect(compacted.matched_cve_records[0]).toHaveProperty('mutation_risk_templates');
       expect(compacted.matched_cve_records[0]).toHaveProperty('negative_assertion_templates');
+      expect(compacted.matched_cve_records[0]).toHaveProperty('payload_packs');
+      expect(compacted.matched_cve_records[0]).toHaveProperty('execution_guards');
       expect(compacted.matched_cve_records[0]).toHaveProperty('safety_profile');
     }
   });
@@ -126,5 +141,36 @@ describe('server assertion internals', () => {
     });
 
     expect(payload.actions[0].type).toBe('scan_plan');
+  });
+
+  test('parseSecurityPayload enriches findings with evidence delta and confidence', () => {
+    const app = loadApp();
+    const parsed = app.__internals.parseSecurityPayload(JSON.stringify({
+      message: 'Detected disclosure.',
+      threat_level: 'medium',
+      findings: [
+        {
+          id: 'F-1',
+          vulnerability: 'InfoDisclosure',
+          severity: 'medium',
+          evidence: 'stack trace',
+          cve_hint: 'CWE-209',
+          remediation: 'Hide stack traces.'
+        }
+      ],
+      actions: []
+    }), {
+      context: {
+        last_response: {
+          status: 500,
+          body_preview: 'Unhandled exception with stack trace in body'
+        },
+        test_history: [{ status: 401 }]
+      }
+    });
+
+    expect(parsed.findings[0]).toHaveProperty('evidence_delta');
+    expect(parsed.findings[0]).toHaveProperty('confidence');
+    expect(parsed.findings[0].confidence).toBeGreaterThan(0);
   });
 });

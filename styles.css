@@ -1336,6 +1336,36 @@ body {
   transform: scale(0.98);
 }
 
+.report-tab-toolbar {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(15, 23, 42, 0.46);
+  border-radius: 14px;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.report-tab-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.report-tab-row:last-child {
+  margin-bottom: 0;
+}
+
+.report-tab-preview {
+  border: 1px solid rgba(100, 116, 139, 0.25);
+  background: rgba(15, 23, 42, 0.42);
+  border-radius: 12px;
+  min-height: 72px;
+  padding: 10px;
+  color: rgba(226, 232, 240, 0.9);
+  font-size: 12px;
+}
+
 .agent-title-row {
   display: flex;
   align-items: baseline;

@@ -1,0 +1,17 @@
+[
+  {
+    "id": "auth-login",
+    "endpoint": "/itxlogin",
+    "expected_family_ids": ["auth-bypass", "session-integrity"]
+  },
+  {
+    "id": "search-query",
+    "endpoint": "/api/search",
+    "expected_family_ids": ["sql-injection", "info-disclosure"]
+  },
+  {
+    "id": "resource-object",
+    "endpoint": "/api/users/{id}",
+    "expected_family_ids": ["bola-idor", "privilege-mass-assignment"]
+  }
+]

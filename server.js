@@ -32,7 +32,10 @@ const OPENROUTER_MODEL_ALIASES = {
   'qwen/qwen3.6-plus': OPENROUTER_QWEN_DEFAULT_MODEL,
   'qwen3.6-plus': OPENROUTER_QWEN_DEFAULT_MODEL,
   'qwen 3.6 plus': OPENROUTER_QWEN_DEFAULT_MODEL,
-  'qwen 3.6 plus free': OPENROUTER_QWEN_DEFAULT_MODEL
+  'qwen 3.6 plus free': OPENROUTER_QWEN_DEFAULT_MODEL,
+  'deepseek/deepseek-v3.2': 'deepseek/deepseek-v3.2',
+  'deepseek v3.2': 'deepseek/deepseek-v3.2',
+  'deepseek-v3.2': 'deepseek/deepseek-v3.2'
 };
 
 const GEMINI_MODELS = {
@@ -1012,6 +1015,7 @@ async function openRouterGenerateJson({ model, systemPrompt, userContent, temper
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent }
       ],
+      reasoning: { enabled: true },
       temperature,
       max_tokens: maxTokens,
       response_format: { type: 'json_object' }
@@ -1280,6 +1284,7 @@ async function groqGenerateJson({ model, systemPrompt, userContent, temperature 
   err.status = 502;
   throw err;
 }
+
 
 function isGroqTokenBudgetError(error) {
   const msg = String(error?.message || '').toLowerCase();

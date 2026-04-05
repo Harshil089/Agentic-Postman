@@ -1774,7 +1774,19 @@ function isRateLimitErrorMessage(message) {
   return msg.includes('rate limit')
     || msg.includes('tokens per minute')
     || msg.includes('please try again in')
-    || msg.includes('quota');
+    || msg.includes('quota')
+    || msg.includes('insufficient balance')
+    || msg.includes('insufficient_balance')
+    || msg.includes('credit');
+}
+
+function isQuotaBalanceErrorMessage(message) {
+  const msg = String(message || '').toLowerCase();
+  return msg.includes('insufficient balance')
+    || msg.includes('insufficient_balance')
+    || msg.includes('quota')
+    || msg.includes('billing')
+    || msg.includes('credit');
 }
 
 function getRetryDelayMs(message) {
@@ -3802,7 +3814,12 @@ async function askAgent() {
       step += 1;
     }
   } catch(e) {
-    addAgentMsg('error', `Agent error: ${e.message}`);
+    if (isQuotaBalanceErrorMessage(e?.message)) {
+      addAgentMsg('error', `Provider quota/balance error: ${e.message}`);
+      addAgentMsg('system', 'If auto-fallback was unavailable, switch provider or add credits to the current provider key.');
+    } else {
+      addAgentMsg('error', `Agent error: ${e.message}`);
+    }
   } finally {
     agentRunState.isRunning = false;
     agentRunState.stopRequested = false;

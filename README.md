@@ -17,7 +17,7 @@ Professionalized Postman-like API IDE with an AI agent backend.
 - `styles.css`: styling
 - `app.js`: frontend state + interactions + calls to backend APIs
 - `workspace-utils.js`: shared pure utilities for request preview, diffing, and template resolution
-- `server.js`: Express server, static hosting, secure OpenRouter/Gemini integration
+- `server.js`: Express server, static hosting, secure multi-provider AI integration
 - `model-capabilities.json`: model reliability and capability registry used by dynamic routing
 - `test/server.request.test.js`: backend route behavior tests for /api/request
 - `test/workspace-utils.test.js`: utility tests for preview, diffing, and template resolution
@@ -71,9 +71,9 @@ cp .env.example .env
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 GEMINI_API_KEY=your_gemini_api_key_here
 GROQ_API_KEY=your_groq_api_key_here
-OPENROUTER_DEFAULT_MODEL=qwen/qwen3.6-plus:free
-OPENROUTER_ADVANCED_MODEL=qwen/qwen3.6-plus:free
-OPENROUTER_SECURITY_MODEL=qwen/qwen3.6-plus:free
+OPENROUTER_DEFAULT_MODEL=deepseek/deepseek-v3.2
+OPENROUTER_ADVANCED_MODEL=deepseek/deepseek-v3.2
+OPENROUTER_SECURITY_MODEL=deepseek/deepseek-v3.2
 OUTBOUND_REQUEST_TIMEOUT_MS=15000
 OUTBOUND_RESPONSE_MAX_BYTES=2097152
 DNS_LOOKUP_TIMEOUT_MS=5000
@@ -118,9 +118,9 @@ npm run ci
 
 ## Notes
 
-- The model provider selector in the agent prompt area lets you switch between OpenRouter and Gemini for `/api/agent`, `/api/assertions`, and `/api/security-agent`.
-- The model provider selector also supports Groq.
+- The model provider selector in the agent prompt area lets you switch between OpenRouter, Gemini, and Groq for `/api/agent`, `/api/assertions`, and `/api/security-agent`.
 - The backend now picks provider-specific model candidates dynamically per task type and de-prioritizes models that fail repeatedly.
+- OpenRouter chat-completion calls are sent with `reasoning: { enabled: true }`.
 - If `OPENROUTER_API_KEY` is missing, OpenRouter calls will fail.
 - If `GEMINI_API_KEY` is missing, Gemini calls will fail.
 - If `GROQ_API_KEY` is missing, Groq calls will fail.
@@ -151,9 +151,9 @@ npm run ci
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 GEMINI_API_KEY=your_gemini_api_key_here
 GROQ_API_KEY=your_groq_api_key_here
-OPENROUTER_DEFAULT_MODEL=qwen/qwen3.6-plus:free
-OPENROUTER_ADVANCED_MODEL=qwen/qwen3.6-plus:free
-OPENROUTER_SECURITY_MODEL=qwen/qwen3.6-plus:free
+OPENROUTER_DEFAULT_MODEL=deepseek/deepseek-v3.2
+OPENROUTER_ADVANCED_MODEL=deepseek/deepseek-v3.2
+OPENROUTER_SECURITY_MODEL=deepseek/deepseek-v3.2
 OUTBOUND_REQUEST_TIMEOUT_MS=15000
 OUTBOUND_RESPONSE_MAX_BYTES=2097152
 DNS_LOOKUP_TIMEOUT_MS=5000

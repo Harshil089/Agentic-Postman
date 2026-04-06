@@ -9,6 +9,7 @@ const importSpec = require('./import-spec');
 const aiContracts = require('./ai-contracts');
 const securityKnowledge = require('./security-knowledge');
 const securityPolicyPacks = require('./security-policy-packs');
+const postmanIntentRag = require('./postman-intent-rag');
 
 dotenv.config();
 
@@ -95,6 +96,7 @@ const TASK_TYPES = {
 
 const MODEL_CAPABILITY_REGISTRY_PATH = path.join(__dirname, 'model-capabilities.json');
 const MODEL_RUNTIME_STATS = new Map();
+const ASK_MODE_SCOPE_BLOCK_MESSAGE = 'This tool is intended only for Postman-centric API tasks and is not intended to do this specific task.';
 const BLOCKED_HOSTNAMES = new Set([
   'localhost',
   'metadata.google.internal'
@@ -2301,6 +2303,23 @@ app.post('/api/agent', async (req, res) => {
     if (!context || typeof context !== 'object') {
       return res.status(400).json({ error: 'Missing request body field: context (object).' });
     }
+    const currentMode = ['planning', 'ask', 'agent'].includes(String(context?.current_mode))
+      ? String(context.current_mode)
+      : 'agent';
+    const askIntentGate = currentMode === 'ask' ? postmanIntentRag.evaluateAskIntent(context) : null;
+    if (currentMode === 'ask' && askIntentGate && !askIntentGate.allowed) {
+      return res.json({
+        message: ASK_MODE_SCOPE_BLOCK_MESSAGE,
+        actions: [],
+        diagnostics: {
+          engine: 'agent',
+          provider: 'scope-gate',
+          model: 'scope-gate',
+          blocked: true,
+          scope_validation: askIntentGate
+        }
+      });
+    }
 
     const systemPrompt = `${AGENT_MASTER_PROMPT}\n\n${MODE_RULES_PROMPT}\n\n${CONTEXT_AWARENESS_PROMPT}`;
     const userContent = JSON.stringify(context);
@@ -2375,6 +2394,29 @@ app.post('/api/agent', async (req, res) => {
       })).raw,
       maxAttempts: 3
     });
+    const askResponseGate = currentMode === 'ask'
+      ? postmanIntentRag.verifyAskResponseScope(repaired.payload)
+      : { allowed: true, confidence: 1, reason: 'not_ask_mode' };
+    if (currentMode === 'ask' && !askResponseGate.allowed) {
+      return res.json({
+        message: ASK_MODE_SCOPE_BLOCK_MESSAGE,
+        actions: [],
+        diagnostics: {
+          ...repaired.diagnostics,
+          engine: 'agent',
+          provider: initialResult.provider,
+          model: initialResult.model,
+          requested_provider: provider,
+          requested_model: selection.preferred,
+          blocked: true,
+          scope_validation: {
+            ask_intent_gate: askIntentGate,
+            ask_response_gate: askResponseGate
+          }
+        }
+      });
+    }
+
     return res.json({
       ...repaired.payload,
       diagnostics: {
@@ -2383,7 +2425,11 @@ app.post('/api/agent', async (req, res) => {
         provider: initialResult.provider,
         model: initialResult.model,
         requested_provider: provider,
-        requested_model: selection.preferred
+        requested_model: selection.preferred,
+        scope_validation: {
+          ask_intent_gate: askIntentGate,
+          ask_response_gate: askResponseGate
+        }
       }
     });
   } catch (error) {
@@ -2852,7 +2898,9 @@ app.__internals = {
   validateSecurityPayloadSemantics,
   validateGeneratedAssertions,
   compactSecurityContext,
-  extractStructuredTextPayload
+  extractStructuredTextPayload,
+  evaluateAskIntent: postmanIntentRag.evaluateAskIntent,
+  verifyAskResponseScope: postmanIntentRag.verifyAskResponseScope
 };
 
 module.exports = app;

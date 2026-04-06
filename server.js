@@ -142,6 +142,9 @@ const BLOCKED_HEADER_NAMES = new Set([
   'set-cookie',
   'authorization'
 ]);
+const SAFE_HEADER_NAME_REGEX = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const MAX_HEADER_NAME_LENGTH = 128;
+const MAX_HEADER_VALUE_LENGTH = 4096;
 
 function loadModelCapabilityRegistry() {
   try {
@@ -300,11 +303,16 @@ async function readResponseTextWithLimit(response, maxBytes) {
 function sanitizeOutboundHeaders(headers) {
   const source = headers && typeof headers === 'object' ? headers : {};
   const safe = {};
-  for (const [key, value] of Object.entries(source)) {
+  for (const [rawKey, value] of Object.entries(source)) {
     if (typeof value !== 'string') continue;
+    const key = String(rawKey || '').trim();
+    if (!key || key.length > MAX_HEADER_NAME_LENGTH) continue;
+    if (!SAFE_HEADER_NAME_REGEX.test(key)) continue;
     const normalized = key.toLowerCase();
     if (BLOCKED_HEADER_NAMES.has(normalized)) continue;
-    safe[key] = value;
+    const cleanedValue = value.replace(/[\r\n\0]/g, '').trim();
+    if (!cleanedValue || cleanedValue.length > MAX_HEADER_VALUE_LENGTH) continue;
+    safe[key] = cleanedValue;
   }
   return safe;
 }

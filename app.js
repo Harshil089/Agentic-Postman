@@ -969,7 +969,7 @@ function renderSnapshotsPanel() {
   if (lastResponse) {
     const hash = lastResponse.bodyHash ? lastResponse.bodyHash.slice(0, 8) : 'N/A';
     html += `<div style="font-size: 0.85rem; color: var(--text2); margin-bottom: 8px;">`;
-    html += `Status: ${lastResponse.status} ${lastResponse.statusText || ''}<br>`;
+    html += `Status: ${escHtml(String(lastResponse.status || ''))} ${escHtml(lastResponse.statusText || '')}<br>`;
     html += `Elapsed: ${lastResponse.elapsed || 0} ms<br>`;
     html += `Body hash: ${hash}...`;
     html += `</div>`;
@@ -1097,13 +1097,19 @@ function renderSidebar() {
   }
   const list = document.getElementById('sidebar-list');
   if (!list) return;
-  list.innerHTML = requests.map(r => `
-    <div class="req-item ${r.id === activeId ? 'active' : ''}" onclick="selectRequest(${r.id})">
-      <span class="method-badge m-${r.method}">${r.method}</span>
-      <span class="req-name">${r.name}</span>
+  list.innerHTML = requests.map(r => {
+    const requestId = Number.isFinite(Number(r.id)) ? Number(r.id) : 0;
+    const method = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(String(r.method || '').toUpperCase())
+      ? String(r.method || '').toUpperCase()
+      : 'GET';
+    return `
+    <div class="req-item ${requestId === activeId ? 'active' : ''}" onclick="selectRequest(${requestId})">
+      <span class="method-badge m-${method}">${method}</span>
+      <span class="req-name">${escHtml(r.name || '')}</span>
       ${r.chainOf ? `<span class="req-chain">⛓</span>` : ''}
     </div>
-  `).join('');
+  `;
+  }).join('');
 }
 
 function renderSidebarWindowNav() {
@@ -1204,7 +1210,12 @@ function renderRequestHistorySidebar() {
           <div class="history-item-body">${escHtml(entry.responsePreview || 'No response preview.')}</div>
           <div class="history-item-diff">${escHtml(entry.diffSummary || 'No diff summary available.')}</div>
           <div class="history-item-actions">
-            <button class="history-replay-btn" type="button" onclick="replayHistoryEntry('${escHtml(entry.id)}')">Replay</button>
+            <button
+              class="history-replay-btn"
+              type="button"
+              data-history-id="${escHtml(encodeURIComponent(String(entry.id || '')))}"
+              onclick="replayHistoryEntry(decodeURIComponent(this.dataset.historyId || ''))"
+            >Replay</button>
           </div>
         </div>
       `;
@@ -1359,7 +1370,14 @@ function addKVRow(tbodyId, k = '', v = '') {
   }
 }
 
-function escHtml(s) { return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function escHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 function sanitizeRichText(html) {
   const template = document.createElement('template');
@@ -1939,7 +1957,9 @@ async function sendRequest(options = {}) {
     stEl.textContent = `${data.status} ${data.statusText || ''}`.trim();
     stEl.className = 'status-tag ' + (data.status < 300 ? 's-2xx' : data.status < 500 ? 's-4xx' : 's-5xx');
     document.getElementById('time-tag').textContent = `${elapsed}ms`;
-    document.getElementById('response-body').textContent = formatted;
+    const responseBodyEl = document.getElementById('response-body');
+    responseBodyEl.textContent = formatted;
+    responseBodyEl.style.color = '';
 
     runAssertions(r.assertions, lastResponse);
     recordRequestHistoryEntry(r, lastResponse);
@@ -1951,12 +1971,17 @@ async function sendRequest(options = {}) {
     if (r.assertions.length === 0 && !skipAutoAssertions) autoSuggestAssertions();
     return lastResponse;
   } catch (e) {
-    lastResponse = { error: e.message };
-    document.getElementById('response-body').innerHTML = `<span style="color:var(--red);">Error: ${e.message}</span>`;
+    const errorMessage = String(e?.message || 'Request failed.');
+    lastResponse = { error: errorMessage };
+    const responseBodyEl = document.getElementById('response-body');
+    if (responseBodyEl) {
+      responseBodyEl.textContent = `Error: ${errorMessage}`;
+      responseBodyEl.style.color = 'var(--red)';
+    }
     document.getElementById('status-tag').textContent = 'FAILED';
     document.getElementById('status-tag').className = 'status-tag s-4xx';
-    logError('request', `${r.method} ${r.url} - ${e.message}`);
-    addAgentMsg('system', `Request failed: ${e.message}. Ask me to debug this error.`);
+    logError('request', `${r.method} ${r.url} - ${errorMessage}`);
+    addAgentMsg('system', `Request failed: ${errorMessage}. Ask me to debug this error.`);
     return null;
   } finally {
     btn.disabled = false;

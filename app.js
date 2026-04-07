@@ -144,18 +144,25 @@ const WORKSPACE_SCHEMA_VERSION = 2;
 const WORKSPACE_HISTORY_LIMIT = 60;
 const WORKSPACE_TEXT_PREVIEW_LIMIT = 320;
 const DEFAULT_ENVIRONMENT_ID = 'default';
-const workspaceUtils = (typeof window !== 'undefined' && window.AgentmanWorkspaceUtils)
-  ? window.AgentmanWorkspaceUtils
-  : {
-      summarizePreview: (text, limit = WORKSPACE_TEXT_PREVIEW_LIMIT) => {
-        const value = String(text || '').trim();
-        if (!value) return '';
-        return value.length > limit ? `${value.slice(0, limit).trimEnd()}...` : value;
-      },
-      describeRequestDiff: () => 'request: no changes; response: no previous run',
-      resolveChainTemplate: (url) => url,
-      resolveVariableTemplate: (text) => text
-    };
+const DEFAULT_WORKSPACE_UTILS = {
+  summarizePreview: (text, limit = WORKSPACE_TEXT_PREVIEW_LIMIT) => {
+    const value = String(text || '').trim();
+    if (!value) return '';
+    return value.length > limit ? `${value.slice(0, limit).trimEnd()}...` : value;
+  },
+  describeRequestDiff: () => 'request: no changes; response: no previous run',
+  resolveChainTemplate: (url) => url,
+  resolveVariableTemplate: (text) => text,
+  collectParamDescriptorsFromRequest: () => [],
+  collectParamCandidatesFromRequest: () => [],
+  arrayBufferToHex: () => '',
+  computeSha256Hash: async () => '',
+  compareToSnapshot: () => null
+};
+const workspaceUtils = {
+  ...DEFAULT_WORKSPACE_UTILS,
+  ...((typeof window !== 'undefined' && window.AgentmanWorkspaceUtils) ? window.AgentmanWorkspaceUtils : {})
+};
 const aiContracts = (typeof window !== 'undefined' && window.AgentmanAiContracts)
   ? window.AgentmanAiContracts
   : null;

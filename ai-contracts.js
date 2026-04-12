@@ -17,7 +17,15 @@
     'CachePoisoning',
     'UnrestrictedUpload',
     'BusinessLogic',
-    'Unknown'
+    'Unknown',
+    // Enhanced injection vectors
+    'XSS',
+    'SSTI',
+    'GraphQLInjection',
+    'LDAPInjection',
+    'XPathInjection',
+    'PrototypePollution',
+    'EmailHeaderInjection'
   ]);
   const SECURITY_THREAT_LEVELS = new Set(['none', 'low', 'medium', 'high', 'critical']);
   const SECURITY_FINDING_SEVERITIES = new Set(['info', 'low', 'medium', 'high', 'critical']);

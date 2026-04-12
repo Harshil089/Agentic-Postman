@@ -2646,6 +2646,61 @@ function buildDeterministicProbeForScanStep(scanPlan, planStep, activeRequest) {
         body: '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>',
         hypothesis: 'A positive result is XML parser expansion, local file disclosure, or parser errors revealing external entity handling.'
       };
+    case 'XSS':
+      return {
+        ...baseProbe,
+        name: 'XSS reflection check',
+        params: [{ k: paramKey, v: '<script>alert(1)</script>' }],
+        hypothesis: 'A positive result is script tag reflected in response or alert execution in DOM context.'
+      };
+    case 'SSTI':
+      return {
+        ...baseProbe,
+        name: 'SSTI arithmetic evaluation check',
+        params: [{ k: paramKey, v: '{{7*7}}' }],
+        hypothesis: 'A positive result is arithmetic expression evaluated (49) or template engine config exposed.'
+      };
+    case 'GraphQLInjection':
+      return {
+        ...baseProbe,
+        name: 'GraphQL introspection check',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/json' }],
+        body: '{"query": "{__typename}"}',
+        hypothesis: 'A positive result is GraphQL schema disclosure or introspection data returned.'
+      };
+    case 'LDAPInjection':
+      return {
+        ...baseProbe,
+        name: 'LDAP wildcard injection check',
+        params: [{ k: paramKey, v: '*)(uid=*))(|(uid=*' }],
+        hypothesis: 'A positive result is LDAP query alteration, authentication bypass, or directory enumeration.'
+      };
+    case 'XPathInjection':
+      return {
+        ...baseProbe,
+        name: 'XPath predicate injection check',
+        params: [{ k: paramKey, v: "' or '1'='1" }],
+        hypothesis: 'A positive result is XPath query manipulation, node traversal, or data extraction.'
+      };
+    case 'PrototypePollution':
+      return {
+        ...baseProbe,
+        name: 'Prototype pollution test',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/json' }],
+        body: JSON.stringify({ __proto__: { test: 'polluted' } }, null, 2),
+        hypothesis: 'A positive result is __proto__ property accepted or prototype chain pollution effects.'
+      };
+    case 'EmailHeaderInjection':
+      return {
+        ...baseProbe,
+        name: 'Email CRLF injection check',
+        method: 'POST',
+        headers: [{ k: 'Content-Type', v: 'application/json' }],
+        body: JSON.stringify({ email: 'test@example.com%0aCc:victim@example.com' }, null, 2),
+        hypothesis: 'A positive result is CRLF characters accepted or additional headers injected.'
+      };
     case 'ParameterPollution':
       return {
         ...baseProbe,

